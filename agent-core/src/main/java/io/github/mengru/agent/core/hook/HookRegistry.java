@@ -1,11 +1,15 @@
 package io.github.mengru.agent.core.hook;
 
+import io.github.mengru.agent.core.memory.MemoryCatalog;
+import io.github.mengru.agent.core.memory.MemoryExtractor;
+import io.github.mengru.agent.core.memory.MemoryStore;
 import io.github.mengru.agent.core.permission.DefaultPermissionChecker;
 import io.github.mengru.agent.core.permission.UserApprover;
+import io.github.mengru.agent.core.prompt.PromptAssemblyHook;
+import io.github.mengru.agent.core.prompt.PromptMode;
 import io.github.mengru.agent.core.skill.LoadSkillTool;
 import io.github.mengru.agent.core.skill.SkillCatalog;
 import io.github.mengru.agent.core.tool.ToolRegistry;
-import io.github.mengru.agent.core.tool.todo.TodoWriteTool;
 
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -41,14 +45,52 @@ public final class HookRegistry {
     }
 
     public static HookRegistry defaultsFor(ToolRegistry toolRegistry, UserApprover userApprover) {
+        return defaultsFor(toolRegistry, userApprover, MemoryCatalog.empty(java.nio.file.Path.of("")));
+    }
+
+    public static HookRegistry defaultsFor(ToolRegistry toolRegistry, UserApprover userApprover, MemoryCatalog memoryCatalog) {
+        return defaultsFor(toolRegistry, userApprover, memoryCatalog, null, null);
+    }
+
+    public static HookRegistry defaultsFor(
+            ToolRegistry toolRegistry,
+            UserApprover userApprover,
+            MemoryCatalog memoryCatalog,
+            PromptMode promptMode
+    ) {
+        return defaultsFor(toolRegistry, userApprover, memoryCatalog, null, null, promptMode);
+    }
+
+    public static HookRegistry defaultsFor(
+            ToolRegistry toolRegistry,
+            UserApprover userApprover,
+            MemoryCatalog memoryCatalog,
+            MemoryExtractor memoryExtractor,
+            MemoryStore memoryStore
+    ) {
+        return defaultsFor(toolRegistry, userApprover, memoryCatalog, memoryExtractor, memoryStore, PromptMode.MAIN);
+    }
+
+    public static HookRegistry defaultsFor(
+            ToolRegistry toolRegistry,
+            UserApprover userApprover,
+            MemoryCatalog memoryCatalog,
+            MemoryExtractor memoryExtractor,
+            MemoryStore memoryStore,
+            PromptMode promptMode
+    ) {
         Objects.requireNonNull(toolRegistry, "toolRegistry must not be null");
+        Objects.requireNonNull(memoryCatalog, "memoryCatalog must not be null");
         HookRegistry registry = empty();
         SkillCatalog skillCatalog = skillCatalogFrom(toolRegistry);
-        if (!skillCatalog.isEmpty()) {
-            registry.registerHook(HookEvent.USER_PROMPT_SUBMIT, new SkillCatalogHook(skillCatalog));
-        }
-        if (toolRegistry.findByName(TodoWriteTool.NAME).isPresent()) {
-            registry.registerHook(HookEvent.USER_PROMPT_SUBMIT, new TodoReminderHook());
+        registry.registerHook(HookEvent.USER_PROMPT_SUBMIT, new PromptAssemblyHook(
+                Objects.requireNonNull(promptMode, "promptMode must not be null"),
+                toolRegistry,
+                memoryCatalog,
+                skillCatalog
+        ));
+        if (memoryExtractor != null && memoryStore != null) {
+            registry.registerHook(HookEvent.STOP, new MemoryExtractionHook(memoryExtractor, memoryStore));
         }
         return registry.registerDefaultPermissionHook(userApprover);
     }

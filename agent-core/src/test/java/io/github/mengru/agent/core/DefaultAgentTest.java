@@ -3,6 +3,8 @@ package io.github.mengru.agent.core;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.AgentStep;
+import io.github.mengru.agent.api.ContextCompressionEvent;
+import io.github.mengru.agent.api.PromptTooLongException;
 import io.github.mengru.agent.api.Tool;
 import io.github.mengru.agent.api.ToolRequest;
 import io.github.mengru.agent.api.ToolResult;
@@ -17,6 +19,7 @@ import io.github.mengru.agent.core.hook.StopContext;
 import io.github.mengru.agent.core.hook.UserPromptSubmitContext;
 import io.github.mengru.agent.core.permission.DefaultPermissionChecker;
 import io.github.mengru.agent.core.permission.UserApprover;
+import io.github.mengru.agent.core.context.ContextManager;
 import io.github.mengru.agent.core.skill.SkillCatalog;
 import io.github.mengru.agent.core.skill.SkillDefinition;
 import io.github.mengru.agent.core.tool.ToolRegistry;
@@ -29,6 +32,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -75,6 +79,26 @@ class DefaultAgentTest {
         assertThat(result.completed()).isFalse();
         assertThat(result.steps()).hasSize(2);
         assertThat(result.output()).isEqualTo("still thinking");
+    }
+
+    @Test
+    void reactiveCompactRetriesOnceWhenPromptIsTooLong() {
+        AtomicInteger calls = new AtomicInteger();
+        DefaultAgent agent = new DefaultAgent((request, previousSteps, tools) -> {
+            if (calls.getAndIncrement() == 0) {
+                throw new PromptTooLongException("too long");
+            }
+            return AgentStep.finalAnswer("recovered");
+        }, ToolRegistry.of(List.of()), HookRegistry.empty(), ContextManager.defaults());
+
+        AgentResult result = agent.run(AgentRequest.of("large task"));
+
+        assertThat(result.completed()).isTrue();
+        assertThat(result.output()).isEqualTo("recovered");
+        assertThat(calls.get()).isEqualTo(2);
+        assertThat(result.compressionEvents())
+                .extracting(ContextCompressionEvent::stage)
+                .contains(ContextCompressionEvent.Stage.REACTIVE_COMPACT);
     }
 
     @Test
@@ -240,6 +264,8 @@ class DefaultAgentTest {
         AgentResult result = agent.run(AgentRequest.of("change files"));
 
         assertThat(result.completed()).isTrue();
+        assertThat(seenSystemPrompt.get()).contains("## identity");
+        assertThat(seenSystemPrompt.get()).contains("## todo_planning");
         assertThat(seenSystemPrompt.get()).contains("todo_write");
     }
 
@@ -260,9 +286,9 @@ class DefaultAgentTest {
         AgentResult result = agent.run(AgentRequest.of("change files"));
 
         assertThat(result.completed()).isTrue();
-        assertThat(seenSystemPrompt.get()).contains("[skill catalog]");
+        assertThat(seenSystemPrompt.get()).contains("## skill_catalog");
         assertThat(seenSystemPrompt.get()).contains("java-agent: Java agent guidance");
-        assertThat(seenSystemPrompt.get().indexOf("[skill catalog]")).isLessThan(seenSystemPrompt.get().indexOf("[todo_write reminder]"));
+        assertThat(seenSystemPrompt.get().indexOf("## skill_catalog")).isLessThan(seenSystemPrompt.get().indexOf("## todo_planning"));
     }
 
     @Test
@@ -293,10 +319,10 @@ class DefaultAgentTest {
     }
 
     @Test
-    void toolMetadataCarriesEffectiveSystemPromptAndOverridesUserMetadata() {
+    void toolMetadataCarriesUserInstructionsAndOverridesUserMetadata() {
         AtomicReference<String> seenParentPrompt = new AtomicReference<>();
         Tool custom = testTool("custom", request -> {
-            seenParentPrompt.set(request.metadata().get(SubagentTool.PARENT_SYSTEM_PROMPT_METADATA_KEY));
+            seenParentPrompt.set(request.metadata().get(SubagentTool.PARENT_USER_INSTRUCTIONS_METADATA_KEY));
             return ToolResult.success("ok");
         });
         DefaultAgent agent = new DefaultAgent((request, previousSteps, tools) -> {
@@ -309,12 +335,12 @@ class DefaultAgentTest {
         AgentResult result = agent.run(new AgentRequest(
                 "metadata",
                 2,
-                java.util.Map.of(SubagentTool.PARENT_SYSTEM_PROMPT_METADATA_KEY, "spoofed"),
-                "real parent prompt"
+                java.util.Map.of(SubagentTool.PARENT_USER_INSTRUCTIONS_METADATA_KEY, "spoofed"),
+                "real user instructions"
         ));
 
         assertThat(result.completed()).isTrue();
-        assertThat(seenParentPrompt.get()).isEqualTo("real parent prompt");
+        assertThat(seenParentPrompt.get()).isEqualTo("real user instructions");
     }
 
     @Test

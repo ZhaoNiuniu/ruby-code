@@ -71,7 +71,7 @@ java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar run \
   "hello qwen"
 ```
 
-Add a custom system prompt when needed:
+Add custom user instructions when needed. The runtime still assembles the agent identity, tools, workspace, memory, skills, and planning sections around it:
 
 ```bash
 java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar run \
@@ -89,7 +89,71 @@ java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar chat \
   --model gpt-4.1-mini
 ```
 
-`agent chat` keeps the most recent 10 successful user/assistant turns in memory. It does not persist sessions across processes and it does not carry tool traces into the next turn. Use `/clear` to reset the current session, and `/exit` or `/quit` to leave chat.
+`agent chat` uses a 10-turn short-term window for successful user/assistant turns. Once that window is exceeded, older turns are folded into compressed memory and the most recent turns remain as plain conversation history. It does not persist sessions across processes and it does not carry tool traces into the next turn. Use `/clear` to reset the current session, and `/exit` or `/quit` to leave chat.
+
+## System Prompt Assembly
+
+The final system prompt is assembled at runtime from sections instead of being hardcoded as one string. Core sections include identity, user instructions, workspace, enabled tools, persistent memory index, project skill catalog, todo planning guidance, and compressed session memory.
+
+Sections load from real runtime state: enabled tools come from `ToolRegistry`, skills from the startup `skills/` scan, and long-term memory from the startup `.memory/` scan. The assembler caches identical system prompts inside the current agent runtime. Relevant long-term memory file contents are injected into the current user turn, not the system prompt, so the stable system sections remain cache-friendly.
+
+## Context Compression
+
+Context compression is enabled by default for both `agent run` and `agent chat`. The agent keeps original execution steps for debugging, but sends a compressed context view to the model when tool results, step count, or estimated prompt size grow too large.
+
+The default budget uses a lightweight estimate of `chars / 4` tokens:
+
+```text
+context window: 128000
+max output:     4000
+reserved:       13000
+```
+
+You can tune or disable it from the CLI:
+
+```bash
+java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar chat \
+  --provider openai-compatible \
+  --model gpt-4.1-mini \
+  --context-window-tokens 128000 \
+  --max-output-tokens 4000 \
+  --reserved-tokens 13000
+
+java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar run \
+  --no-context-compression \
+  "debug without compression"
+```
+
+`agent chat` remains in-process only. When the successful conversation history exceeds the short-term window, older turns are folded into compressed memory and the most recent turns stay as plain conversation history. `/clear` removes both conversation history and compressed memory.
+
+## Persistent Memory
+
+Persistent memory is project-local and private by default. The agent stores long-term memories under `.memory/` and maintains a root `MEMORY.md` index; both are ignored by Git. This layer is separate from in-process `AgentMemory`: persistent memory survives compression and new CLI processes, while `AgentMemory` only keeps the current run/session coherent.
+
+Each memory is a Markdown file with minimal frontmatter:
+
+```markdown
+---
+name: tab-indentation
+description: User prefers tabs instead of spaces for indentation.
+type: user
+---
+
+Use tabs instead of spaces when editing project code.
+```
+
+Supported memory types are `user`, `feedback`, `project`, and `reference`. At startup, the CLI scans `.memory/` once: `agent run` scans once per command, and `agent chat` scans once for the whole chat process. `/clear` does not reload persistent memory.
+
+The read path is deterministic: the `MEMORY.md` index is included as a runtime system section, and up to three relevant memory files are matched by the current task and recent conversation, then injected into the current user turn. The `echo` provider only reads memory. The `openai-compatible` provider can also write memory after a successful turn when the user explicitly asks the agent to remember something or states a stable preference, feedback pattern, project fact, or reference clue.
+
+Manage local memory from the CLI:
+
+```bash
+java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar memory list
+java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar memory show tab-indentation
+```
+
+Invalid memory files are skipped with warnings instead of failing startup. v1 does not compact, deduplicate, or sync memory; that remains a separate maintenance step.
 
 ## Default Tools
 

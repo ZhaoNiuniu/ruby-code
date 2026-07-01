@@ -18,8 +18,9 @@ class AgentRequestTest {
         assertThat(request.task()).isEqualTo("summarize this");
         assertThat(request.maxSteps()).isEqualTo(8);
         assertThat(request.metadata()).isEmpty();
-        assertThat(request.systemPrompt()).contains("Use available tools");
+        assertThat(request.systemPrompt()).isEmpty();
         assertThat(request.conversationHistory()).isEmpty();
+        assertThat(request.memory().isEmpty()).isTrue();
     }
 
     @Test
@@ -51,6 +52,39 @@ class AgentRequestTest {
         assertThat(request.conversationHistory())
                 .containsExactly(ConversationMessage.user("first question"));
         assertThatThrownBy(() -> request.conversationHistory().add(ConversationMessage.assistant("other")))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void supportsExplicitMemory() {
+        AgentRequest request = new AgentRequest(
+                "run",
+                3,
+                Map.of(),
+                "system",
+                List.of(),
+                AgentMemory.of("## Goal\n\nKeep going")
+        );
+
+        assertThat(request.memory().markdown()).contains("Keep going");
+    }
+
+    @Test
+    void agentResultCopiesCompressionEvents() {
+        List<ContextCompressionEvent> events = new ArrayList<>();
+        events.add(new ContextCompressionEvent(
+                ContextCompressionEvent.Stage.MICRO_COMPACT,
+                "reason",
+                10,
+                5,
+                "summary"
+        ));
+
+        AgentResult result = new AgentResult("ok", List.of(), true, events);
+        events.clear();
+
+        assertThat(result.compressionEvents()).hasSize(1);
+        assertThatThrownBy(() -> result.compressionEvents().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
     }
 }

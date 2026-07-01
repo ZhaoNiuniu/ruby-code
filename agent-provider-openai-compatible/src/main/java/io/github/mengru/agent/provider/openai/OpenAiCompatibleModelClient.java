@@ -9,6 +9,7 @@ import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentStep;
 import io.github.mengru.agent.api.ConversationMessage;
 import io.github.mengru.agent.api.ModelClient;
+import io.github.mengru.agent.api.PromptTooLongException;
 import io.github.mengru.agent.api.Tool;
 
 import java.io.IOException;
@@ -98,6 +99,10 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
         }
 
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            if (isPromptTooLong(response.statusCode(), response.body())) {
+                throw new PromptTooLongException("OpenAI-compatible request prompt is too long: HTTP "
+                        + response.statusCode() + ": " + response.body());
+            }
             throw new OpenAiCompatibleException("OpenAI-compatible request failed with HTTP "
                     + response.statusCode() + ": " + response.body());
         }
@@ -118,10 +123,11 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
 
     private ArrayNode buildMessages(AgentRequest request, List<AgentStep> previousSteps) {
         ArrayNode messages = objectMapper.createArrayNode();
-        if (!request.systemPrompt().isBlank()) {
+        String systemContent = systemContent(request);
+        if (!systemContent.isBlank()) {
             ObjectNode system = messages.addObject();
             system.put("role", "system");
-            system.put("content", request.systemPrompt());
+            system.put("content", systemContent);
         }
 
         for (ConversationMessage historyMessage : request.conversationHistory()) {
@@ -140,6 +146,10 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
             }
         }
         return messages;
+    }
+
+    private String systemContent(AgentRequest request) {
+        return request.systemPrompt();
     }
 
     private ObjectNode conversationMessage(ConversationMessage message) {
@@ -298,6 +308,17 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
             }
         }
         return null;
+    }
+
+    private boolean isPromptTooLong(int statusCode, String body) {
+        if (statusCode == 413) {
+            return true;
+        }
+        String normalized = body == null ? "" : body.toLowerCase(java.util.Locale.ROOT);
+        return normalized.contains("context_length_exceeded")
+                || normalized.contains("prompt_too_long")
+                || normalized.contains("context length")
+                || normalized.contains("maximum context");
     }
 
     private static String textValue(JsonNode node, String field) {

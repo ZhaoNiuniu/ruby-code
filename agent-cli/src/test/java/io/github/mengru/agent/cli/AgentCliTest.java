@@ -6,19 +6,26 @@ import io.github.mengru.agent.api.AgentStep;
 import io.github.mengru.agent.api.ModelClient;
 import io.github.mengru.agent.api.Tool;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
+import java.io.IOException;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class AgentCliTest {
+
+    @TempDir
+    Path workspace;
 
     @Test
     void runsTaskFromCommandLine() {
@@ -217,6 +224,53 @@ class AgentCliTest {
     }
 
     @Test
+    void runAcceptsContextCompressionOptions() {
+        StringWriter out = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("ok")
+        );
+        commandLine.setOut(new PrintWriter(out));
+
+        int exitCode = commandLine.execute(
+                "run",
+                "--no-context-compression",
+                "--context-window-tokens", "100",
+                "--max-output-tokens", "20",
+                "--reserved-tokens", "20",
+                "hello"
+        );
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("ok");
+    }
+
+    @Test
+    void runRejectsInvalidContextCompressionBudget() {
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("ok")
+        );
+        commandLine.setErr(new PrintWriter(err));
+
+        int exitCode = commandLine.execute(
+                "run",
+                "--context-window-tokens", "100",
+                "--max-output-tokens", "80",
+                "--reserved-tokens", "30",
+                "hello"
+        );
+
+        assertThat(exitCode).isEqualTo(CommandLine.ExitCode.USAGE);
+        assertThat(err.toString()).contains("contextWindowTokens");
+    }
+
+    @Test
     void chatKeepsSuccessfulConversationHistoryAcrossInputLines() {
         ModelClient model = (request, previousSteps, tools) ->
                 AgentStep.finalAnswer("history=" + request.conversationHistory().size() + ", task=" + request.task());
@@ -300,6 +354,33 @@ class AgentCliTest {
         assertThat(out.toString()).contains("history=0");
     }
 
+    @Test
+    void memoryListShowsIndex() throws IOException {
+        writeMemory("style.md", "tab-style", "Use tab indentation", "user", "Use tabs instead of spaces.");
+        StringWriter out = new StringWriter();
+        CommandLine commandLine = new CommandLine(new AgentCli.MemoryListCommand(workspace));
+        commandLine.setOut(new PrintWriter(out));
+
+        int exitCode = commandLine.execute();
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("tab-style");
+        assertThat(out.toString()).contains("Use tab indentation");
+    }
+
+    @Test
+    void memoryShowPrintsMemoryContent() throws IOException {
+        writeMemory("style.md", "tab-style", "Use tab indentation", "user", "Use tabs instead of spaces.");
+        StringWriter out = new StringWriter();
+        CommandLine commandLine = new CommandLine(new AgentCli.MemoryShowCommand(workspace));
+        commandLine.setOut(new PrintWriter(out));
+
+        int exitCode = commandLine.execute("tab-style");
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("Use tabs instead of spaces.");
+    }
+
     private static ModelClient writeFileModel(String path) {
         ObjectNode arguments = JsonNodeFactory.instance.objectNode();
         arguments.put("path", path);
@@ -310,5 +391,19 @@ class AgentCliTest {
             }
             return AgentStep.finalAnswer(previousSteps.get(previousSteps.size() - 1).content());
         };
+    }
+
+    private void writeMemory(String fileName, String name, String description, String type, String body) throws IOException {
+        Path memoryDir = workspace.resolve(".memory");
+        Files.createDirectories(memoryDir);
+        Files.writeString(memoryDir.resolve(fileName), """
+                ---
+                name: %s
+                description: %s
+                type: %s
+                ---
+                
+                %s
+                """.formatted(name, description, type, body), StandardCharsets.UTF_8);
     }
 }

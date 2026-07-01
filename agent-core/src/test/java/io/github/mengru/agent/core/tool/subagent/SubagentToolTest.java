@@ -9,10 +9,15 @@ import io.github.mengru.agent.api.Tool;
 import io.github.mengru.agent.api.ToolRequest;
 import io.github.mengru.agent.api.ToolResult;
 import io.github.mengru.agent.core.permission.UserApprover;
+import io.github.mengru.agent.core.memory.MemoryCatalog;
 import io.github.mengru.agent.core.skill.SkillCatalog;
 import io.github.mengru.agent.core.skill.SkillDefinition;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +27,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class SubagentToolTest {
+
+    @TempDir
+    Path workspace;
 
     @Test
     void exposesJsonSchemaForSubagentTask() {
@@ -71,7 +79,7 @@ class SubagentToolTest {
     }
 
     @Test
-    void expectedOutputAndParentSystemPromptAreIncludedInChildPrompt() {
+    void expectedOutputAndParentUserInstructionsAreIncludedInChildPrompt() {
         AtomicReference<String> systemPrompt = new AtomicReference<>();
         ModelClient model = (request, previousSteps, tools) -> {
             systemPrompt.set(request.systemPrompt());
@@ -85,10 +93,11 @@ class SubagentToolTest {
         ToolResult result = tool.execute(request(arguments));
 
         assertThat(result.success()).isTrue();
-        assertThat(systemPrompt.get()).contains("Expected output:");
+        assertThat(systemPrompt.get()).contains("## subagent_expected_output");
         assertThat(systemPrompt.get()).contains("include concrete file references");
-        assertThat(systemPrompt.get()).contains("Parent agent system prompt:");
+        assertThat(systemPrompt.get()).contains("## user_instructions");
         assertThat(systemPrompt.get()).contains("parent prompt");
+        assertThat(systemPrompt.get()).doesNotContain("Parent agent system prompt:");
     }
 
     @Test
@@ -150,6 +159,30 @@ class SubagentToolTest {
     }
 
     @Test
+    void childAgentCanReadRelevantPersistentMemory() throws IOException {
+        writeMemory("style.md", "tab-style", "Use tab indentation", "user", "Use tabs instead of spaces.");
+        AtomicReference<String> seenTask = new AtomicReference<>();
+        ModelClient model = (request, previousSteps, tools) -> {
+            seenTask.set(request.task());
+            return AgentStep.finalAnswer("Summary:\nok\nEvidence:\nmemory\nRecommended next step:\ncontinue");
+        };
+        SubagentTool tool = new SubagentTool(
+                model,
+                UserApprover.denyAll(),
+                SkillCatalog.empty(),
+                MemoryCatalog.scan(workspace)
+        );
+        ObjectNode arguments = args();
+        arguments.put("description", "inspect tab style");
+
+        ToolResult result = tool.execute(request(arguments));
+
+        assertThat(result.success()).isTrue();
+        assertThat(seenTask.get()).contains("Relevant Long-Term Memory");
+        assertThat(seenTask.get()).contains("Use tabs instead of spaces");
+    }
+
+    @Test
     void incompleteChildRunReturnsToolFailure() {
         SubagentTool tool = new SubagentTool((request, previousSteps, tools) -> AgentStep.thought("still working"), UserApprover.denyAll());
         ObjectNode arguments = args();
@@ -204,7 +237,7 @@ class SubagentToolTest {
         return new ToolRequest(
                 SubagentTool.NAME,
                 arguments,
-                Map.of(SubagentTool.PARENT_SYSTEM_PROMPT_METADATA_KEY, "parent prompt")
+                Map.of(SubagentTool.PARENT_USER_INSTRUCTIONS_METADATA_KEY, "parent prompt")
         );
     }
 
@@ -219,5 +252,19 @@ class SubagentToolTest {
                 Path.of("skills/java-agent/SKILL.md"),
                 "content"
         )));
+    }
+
+    private void writeMemory(String fileName, String name, String description, String type, String body) throws IOException {
+        Path memoryDir = workspace.resolve(".memory");
+        Files.createDirectories(memoryDir);
+        Files.writeString(memoryDir.resolve(fileName), """
+                ---
+                name: %s
+                description: %s
+                type: %s
+                ---
+                
+                %s
+                """.formatted(name, description, type, body), StandardCharsets.UTF_8);
     }
 }

@@ -36,7 +36,7 @@ class AgentSessionTest {
     }
 
     @Test
-    void retainsOnlyMostRecentTenCompletedTurnsByDefault() {
+    void compactsOldTurnsIntoMemoryAfterHistoryWindow() {
         AgentSession session = new AgentSession(request ->
                 new AgentResult("answer " + request.task(), List.of(), true));
 
@@ -44,9 +44,11 @@ class AgentSessionTest {
             session.run(AgentRequest.of("task-" + i));
         }
 
-        assertThat(session.conversationHistory()).hasSize(20);
-        assertThat(session.conversationHistory().get(0)).isEqualTo(ConversationMessage.user("task-2"));
-        assertThat(session.conversationHistory().get(19)).isEqualTo(ConversationMessage.assistant("answer task-11"));
+        assertThat(session.conversationHistory()).hasSize(8);
+        assertThat(session.conversationHistory().get(0)).isEqualTo(ConversationMessage.user("task-8"));
+        assertThat(session.conversationHistory().get(7)).isEqualTo(ConversationMessage.assistant("answer task-11"));
+        assertThat(session.memory().markdown()).contains("task-0");
+        assertThat(session.memory().markdown()).contains("answer task-7");
     }
 
     @Test
@@ -103,5 +105,25 @@ class AgentSessionTest {
         session.clear();
 
         assertThat(session.conversationHistory()).isEmpty();
+        assertThat(session.memory().isEmpty()).isTrue();
+    }
+
+    @Test
+    void compactedMemoryIsSentToNextTurn() {
+        AtomicReference<String> seenMemory = new AtomicReference<>();
+        Agent agent = request -> {
+            if ("after-compact".equals(request.task())) {
+                seenMemory.set(request.memory().markdown());
+            }
+            return new AgentResult("answer " + request.task(), List.of(), true);
+        };
+        AgentSession session = new AgentSession(agent);
+        for (int i = 0; i < 12; i++) {
+            session.run(AgentRequest.of("task-" + i));
+        }
+
+        session.run(AgentRequest.of("after-compact"));
+
+        assertThat(seenMemory.get()).contains("task-0");
     }
 }

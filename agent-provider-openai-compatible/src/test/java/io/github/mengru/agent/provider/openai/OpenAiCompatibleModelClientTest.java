@@ -2,12 +2,14 @@ package io.github.mengru.agent.provider.openai;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.mengru.agent.api.AgentMemory;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.AgentStep;
 import io.github.mengru.agent.api.ConversationMessage;
 import io.github.mengru.agent.core.DefaultAgent;
 import io.github.mengru.agent.core.EchoTool;
+import io.github.mengru.agent.api.PromptTooLongException;
 import org.junit.jupiter.api.Test;
 
 import javax.net.ssl.SSLContext;
@@ -130,6 +132,33 @@ class OpenAiCompatibleModelClientTest {
     }
 
     @Test
+    void usesAlreadyAssembledSystemPromptWithoutAppendingMemory() {
+        responses.add(new FakeResponse(200, """
+                {"choices":[{"message":{"role":"assistant","content":"done"}}]}
+                """));
+
+        client().nextStep(
+                new AgentRequest(
+                        "current question",
+                        8,
+                        Map.of(),
+                        "system prompt",
+                        List.of(ConversationMessage.user("previous question")),
+                        AgentMemory.of("## Goal\n\nRemember the compressed goal.")
+                ),
+                List.of(),
+                List.of()
+        );
+
+        JsonNode messages = requests.get(0).get("messages");
+        assertThat(messages.get(0).get("role").asText()).isEqualTo("system");
+        assertThat(messages.get(0).get("content").asText()).isEqualTo("system prompt");
+        assertThat(messages.get(0).get("content").asText()).doesNotContain("Remember the compressed goal");
+        assertThat(messages.get(1).get("role").asText()).isEqualTo("user");
+        assertThat(messages.get(1).get("content").asText()).isEqualTo("previous question");
+    }
+
+    @Test
     void requiresApiKeyFromEnvironment() {
         assertThatThrownBy(() -> OpenAiCompatibleModelClient.fromEnvironment("model", Map.of()))
                 .isInstanceOf(OpenAiCompatibleException.class)
@@ -178,6 +207,15 @@ class OpenAiCompatibleModelClientTest {
         assertThatThrownBy(() -> client().nextStep(AgentRequest.of("hello"), List.of(), List.of()))
                 .isInstanceOf(OpenAiCompatibleException.class)
                 .hasMessageContaining("HTTP 401");
+    }
+
+    @Test
+    void mapsPromptTooLongResponsesToTypedException() {
+        responses.add(new FakeResponse(413, "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}"));
+
+        assertThatThrownBy(() -> client().nextStep(AgentRequest.of("hello"), List.of(), List.of()))
+                .isInstanceOf(PromptTooLongException.class)
+                .hasMessageContaining("prompt is too long");
     }
 
     @Test

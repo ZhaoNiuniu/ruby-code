@@ -11,7 +11,10 @@ import io.github.mengru.agent.api.ToolRequest;
 import io.github.mengru.agent.api.ToolResult;
 import io.github.mengru.agent.core.DefaultAgent;
 import io.github.mengru.agent.core.hook.HookRegistry;
+import io.github.mengru.agent.core.memory.MemoryCatalog;
 import io.github.mengru.agent.core.permission.UserApprover;
+import io.github.mengru.agent.core.prompt.PromptAssembler;
+import io.github.mengru.agent.core.prompt.PromptMode;
 import io.github.mengru.agent.core.skill.SkillCatalog;
 import io.github.mengru.agent.core.tool.ToolRegistry;
 
@@ -21,33 +24,31 @@ import java.util.Objects;
 public final class SubagentTool implements Tool {
 
     public static final String NAME = "subagent";
-    public static final String PARENT_SYSTEM_PROMPT_METADATA_KEY = "agent.systemPrompt";
+    public static final String PARENT_USER_INSTRUCTIONS_METADATA_KEY = PromptAssembler.USER_INSTRUCTIONS_METADATA_KEY;
+    @Deprecated
+    public static final String PARENT_SYSTEM_PROMPT_METADATA_KEY = PARENT_USER_INSTRUCTIONS_METADATA_KEY;
 
     static final int DEFAULT_MAX_STEPS = 6;
     static final int MAX_STEPS_LIMIT = 12;
 
-    private static final String SUB_SYSTEM = """
-            You are a focused investigation subagent running in an isolated context.
-            Complete the delegated investigation directly and do not delegate it again.
-            You may use only the tools provided to you. You must not modify files.
-            Return only a concise final report with exactly these sections:
-            Summary:
-            Evidence:
-            Recommended next step:
-            """.strip();
-
     private final ModelClient modelClient;
     private final UserApprover userApprover;
     private final SkillCatalog skillCatalog;
+    private final MemoryCatalog memoryCatalog;
 
     public SubagentTool(ModelClient modelClient, UserApprover userApprover) {
         this(modelClient, userApprover, SkillCatalog.empty());
     }
 
     public SubagentTool(ModelClient modelClient, UserApprover userApprover, SkillCatalog skillCatalog) {
+        this(modelClient, userApprover, skillCatalog, MemoryCatalog.empty(java.nio.file.Path.of("")));
+    }
+
+    public SubagentTool(ModelClient modelClient, UserApprover userApprover, SkillCatalog skillCatalog, MemoryCatalog memoryCatalog) {
         this.modelClient = Objects.requireNonNull(modelClient, "modelClient must not be null");
         this.userApprover = Objects.requireNonNull(userApprover, "userApprover must not be null");
         this.skillCatalog = Objects.requireNonNull(skillCatalog, "skillCatalog must not be null");
+        this.memoryCatalog = Objects.requireNonNull(memoryCatalog, "memoryCatalog must not be null");
     }
 
     @Override
@@ -96,14 +97,18 @@ public final class SubagentTool implements Tool {
         } catch (IllegalArgumentException e) {
             return ToolResult.failure(e.getMessage());
         }
-        String systemPrompt = buildSystemPrompt(request);
         ToolRegistry childTools = ToolRegistry.investigationTools(skillCatalog);
         DefaultAgent childAgent = new DefaultAgent(
                 modelClient,
                 childTools,
-                HookRegistry.defaultsFor(childTools, userApprover)
+                HookRegistry.defaultsFor(childTools, userApprover, memoryCatalog, PromptMode.SUBAGENT)
         );
-        AgentResult result = childAgent.run(new AgentRequest(description, maxSteps, Map.of(), systemPrompt));
+        AgentResult result = childAgent.run(new AgentRequest(
+                description,
+                maxSteps,
+                childMetadata(request),
+                parentUserInstructions(request)
+        ));
         if (!result.completed()) {
             return ToolResult.failure("subagent did not complete: " + result.output());
         }
@@ -125,18 +130,17 @@ public final class SubagentTool implements Tool {
         return Math.min(requested, MAX_STEPS_LIMIT);
     }
 
-    private String buildSystemPrompt(ToolRequest request) {
-        StringBuilder prompt = new StringBuilder(SUB_SYSTEM);
+    private Map<String, String> childMetadata(ToolRequest request) {
         String expectedOutput = request.stringArgument("expectedOutput").strip();
-        if (!expectedOutput.isBlank()) {
-            prompt.append("\n\nExpected output:\n").append(expectedOutput);
+        if (expectedOutput.isBlank()) {
+            return Map.of();
         }
-        String parentSystemPrompt = request.metadata()
-                .getOrDefault(PARENT_SYSTEM_PROMPT_METADATA_KEY, "")
+        return Map.of(PromptAssembler.SUBAGENT_EXPECTED_OUTPUT_METADATA_KEY, expectedOutput);
+    }
+
+    private String parentUserInstructions(ToolRequest request) {
+        return request.metadata()
+                .getOrDefault(PARENT_USER_INSTRUCTIONS_METADATA_KEY, "")
                 .strip();
-        if (!parentSystemPrompt.isBlank()) {
-            prompt.append("\n\nParent agent system prompt:\n").append(parentSystemPrompt);
-        }
-        return prompt.toString();
     }
 }

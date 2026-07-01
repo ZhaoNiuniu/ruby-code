@@ -93,8 +93,9 @@ class HookRegistryTest {
         HookResult<UserPromptSubmitContext> second = registry.triggerHooks(HookEvent.USER_PROMPT_SUBMIT, first.context());
 
         assertThat(first.context().request().systemPrompt()).contains("base prompt");
+        assertThat(first.context().request().systemPrompt()).contains("## todo_planning");
         assertThat(first.context().request().systemPrompt()).contains("todo_write");
-        assertThat(countOccurrences(second.context().request().systemPrompt(), TodoReminderHook.MARKER)).isEqualTo(1);
+        assertThat(countOccurrences(second.context().request().systemPrompt(), "## todo_planning")).isEqualTo(1);
     }
 
     @Test
@@ -112,10 +113,10 @@ class HookRegistryTest {
 
         String systemPrompt = first.context().request().systemPrompt();
         assertThat(systemPrompt).contains("base prompt");
-        assertThat(systemPrompt).contains(SkillCatalogHook.MARKER);
+        assertThat(systemPrompt).contains("## skill_catalog");
         assertThat(systemPrompt).contains("java-agent: Java agent guidance");
-        assertThat(systemPrompt.indexOf(SkillCatalogHook.MARKER)).isLessThan(systemPrompt.indexOf(TodoReminderHook.MARKER));
-        assertThat(countOccurrences(second.context().request().systemPrompt(), SkillCatalogHook.MARKER)).isEqualTo(1);
+        assertThat(systemPrompt.indexOf("## skill_catalog")).isLessThan(systemPrompt.indexOf("## todo_planning"));
+        assertThat(countOccurrences(second.context().request().systemPrompt(), "## skill_catalog")).isEqualTo(1);
     }
 
     @Test
@@ -130,7 +131,10 @@ class HookRegistryTest {
                 new UserPromptSubmitContext(new AgentRequest("change files", 8, java.util.Map.of(), "base prompt"))
         );
 
-        assertThat(result.context().request().systemPrompt()).isEqualTo("base prompt");
+        assertThat(result.context().request().systemPrompt()).contains("## identity");
+        assertThat(result.context().request().systemPrompt()).contains("## user_instructions");
+        assertThat(result.context().request().systemPrompt()).contains("base prompt");
+        assertThat(result.context().request().systemPrompt()).doesNotContain("## todo_planning");
     }
 
     private static int countOccurrences(String value, String needle) {

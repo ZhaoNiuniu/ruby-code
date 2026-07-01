@@ -2,6 +2,7 @@ package io.github.mengru.agent.core.tool;
 
 import io.github.mengru.agent.api.ModelClient;
 import io.github.mengru.agent.api.Tool;
+import io.github.mengru.agent.core.memory.MemoryCatalog;
 import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.skill.LoadSkillTool;
 import io.github.mengru.agent.core.skill.SkillCatalog;
@@ -64,7 +65,17 @@ public final class ToolRegistry {
     }
 
     public static ToolRegistry defaultToolsWithSubagent(ModelClient modelClient, UserApprover userApprover, SkillCatalog skillCatalog) {
+        return defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, MemoryCatalog.empty(java.nio.file.Path.of("")));
+    }
+
+    public static ToolRegistry defaultToolsWithSubagent(
+            ModelClient modelClient,
+            UserApprover userApprover,
+            SkillCatalog skillCatalog,
+            MemoryCatalog memoryCatalog
+    ) {
         Objects.requireNonNull(skillCatalog, "skillCatalog must not be null");
+        Objects.requireNonNull(memoryCatalog, "memoryCatalog must not be null");
         Builder builder = builder()
                 .add(new TodoWriteTool());
         addLoadSkillTool(builder, skillCatalog);
@@ -72,7 +83,8 @@ public final class ToolRegistry {
                 .add(new SubagentTool(
                         Objects.requireNonNull(modelClient, "modelClient must not be null"),
                         Objects.requireNonNull(userApprover, "userApprover must not be null"),
-                        skillCatalog
+                        skillCatalog,
+                        memoryCatalog
                 ))
                 .add(new BashTool())
                 .add(new ReadFileTool())

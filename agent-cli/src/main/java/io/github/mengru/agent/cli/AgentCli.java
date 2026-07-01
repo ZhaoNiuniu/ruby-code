@@ -6,7 +6,13 @@ import io.github.mengru.agent.api.ModelClient;
 import io.github.mengru.agent.core.AgentSession;
 import io.github.mengru.agent.core.DefaultAgent;
 import io.github.mengru.agent.core.EchoModelClient;
+import io.github.mengru.agent.core.context.ContextCompressionConfig;
+import io.github.mengru.agent.core.context.ContextManager;
 import io.github.mengru.agent.core.hook.HookRegistry;
+import io.github.mengru.agent.core.memory.MemoryCatalog;
+import io.github.mengru.agent.core.memory.MemoryDefinition;
+import io.github.mengru.agent.core.memory.MemoryExtractor;
+import io.github.mengru.agent.core.memory.MemoryStore;
 import io.github.mengru.agent.core.permission.PermissionRequest;
 import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.skill.SkillCatalog;
@@ -26,6 +32,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -67,6 +75,7 @@ public final class AgentCli implements Callable<Integer> {
         CommandLine commandLine = new CommandLine(new AgentCli(environment));
         commandLine.addSubcommand("run", new RunCommand(environment, inputStream, interactiveApproval));
         commandLine.addSubcommand("chat", new ChatCommand(environment, inputStream, interactiveApproval));
+        commandLine.addSubcommand("memory", new MemoryCommand());
         return commandLine;
     }
 
@@ -79,6 +88,7 @@ public final class AgentCli implements Callable<Integer> {
         CommandLine commandLine = new CommandLine(new AgentCli(environment));
         commandLine.addSubcommand("run", new RunCommand(environment, inputStream, interactiveApproval, fixedModelClient));
         commandLine.addSubcommand("chat", new ChatCommand(environment, inputStream, interactiveApproval, fixedModelClient));
+        commandLine.addSubcommand("memory", new MemoryCommand());
         return commandLine;
     }
 
@@ -86,6 +96,17 @@ public final class AgentCli implements Callable<Integer> {
     public Integer call() {
         spec.commandLine().usage(System.out);
         return 0;
+    }
+
+    private static MemoryCatalog prepareMemoryCatalog(MemoryStore memoryStore) {
+        MemoryCatalog memoryCatalog = memoryStore.catalog();
+        if (!memoryCatalog.isEmpty()
+                || !memoryCatalog.warnings().isEmpty()
+                || Files.exists(memoryCatalog.memoryDir())
+                || Files.exists(memoryCatalog.indexFile())) {
+            memoryStore.ensureGitIgnore();
+        }
+        return memoryCatalog;
     }
 
     @Command(name = "run", description = "Runs a task through the default echo agent.")
@@ -133,6 +154,18 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--system", description = "System prompt for the agent.")
         private String systemPrompt;
 
+        @Option(names = "--no-context-compression", description = "Disable context compression for this run.")
+        private boolean noContextCompression;
+
+        @Option(names = "--context-window-tokens", defaultValue = "128000", description = "Estimated context window tokens.")
+        private int contextWindowTokens;
+
+        @Option(names = "--max-output-tokens", defaultValue = "4000", description = "Estimated maximum output tokens.")
+        private int maxOutputTokens;
+
+        @Option(names = "--reserved-tokens", defaultValue = "13000", description = "Estimated reserved tokens for safety margin.")
+        private int reservedTokens;
+
         @Parameters(arity = "0..*", paramLabel = "TASK", description = "Task for the agent to run.")
         private List<String> taskParts;
 
@@ -149,11 +182,15 @@ public final class AgentCli implements Callable<Integer> {
                 ModelClient modelClient = createModelClient();
                 UserApprover userApprover = createUserApprover();
                 SkillCatalog skillCatalog = SkillCatalog.scanDefault();
-                ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog);
+                MemoryStore memoryStore = MemoryStore.defaultStore();
+                MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
+                printMemoryWarnings(memoryCatalog);
+                ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, memoryCatalog);
                 agent = new DefaultAgent(
                         modelClient,
                         toolRegistry,
-                        HookRegistry.defaultsFor(toolRegistry, userApprover)
+                        createHookRegistry(toolRegistry, userApprover, modelClient, memoryStore, memoryCatalog),
+                        createContextManager()
                 );
             } catch (IllegalArgumentException | OpenAiCompatibleException e) {
                 spec.commandLine().getErr().println(e.getMessage());
@@ -219,6 +256,53 @@ public final class AgentCli implements Callable<Integer> {
                 }
                 default -> throw new IllegalArgumentException("Unknown provider: " + provider);
             };
+        }
+
+        private ContextManager createContextManager() {
+            if (noContextCompression) {
+                return ContextManager.disabled();
+            }
+            return ContextManager.withConfig(new ContextCompressionConfig(
+                    true,
+                    contextWindowTokens,
+                    maxOutputTokens,
+                    reservedTokens,
+                    ContextCompressionConfig.DEFAULT_TOOL_RESULT_BUDGET_CHARS,
+                    ContextCompressionConfig.DEFAULT_MAX_MESSAGES,
+                    ContextCompressionConfig.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
+                    ContextCompressionConfig.DEFAULT_RECENT_LOGICAL_ITEMS_AFTER_AUTO_COMPACT,
+                    ContextCompressionConfig.DEFAULT_REACTIVE_RECENT_LOGICAL_ITEMS,
+                    ContextCompressionConfig.DEFAULT_MAX_AUTO_COMPACT_FAILURES
+            ));
+        }
+
+        private HookRegistry createHookRegistry(
+                ToolRegistry toolRegistry,
+                UserApprover userApprover,
+                ModelClient modelClient,
+                MemoryStore memoryStore,
+                MemoryCatalog memoryCatalog
+        ) {
+            if (memoryWriteEnabled()) {
+                return HookRegistry.defaultsFor(
+                        toolRegistry,
+                        userApprover,
+                        memoryCatalog,
+                        new MemoryExtractor(modelClient),
+                        memoryStore
+                );
+            }
+            return HookRegistry.defaultsFor(toolRegistry, userApprover, memoryCatalog);
+        }
+
+        private boolean memoryWriteEnabled() {
+            return fixedModelClient == null && "openai-compatible".equals(provider);
+        }
+
+        private void printMemoryWarnings(MemoryCatalog memoryCatalog) {
+            for (String warning : memoryCatalog.warnings()) {
+                spec.commandLine().getErr().println("Memory warning: " + warning);
+            }
         }
 
         private String resolveModel() {
@@ -293,6 +377,18 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--system", description = "System prompt for the agent.")
         private String systemPrompt;
 
+        @Option(names = "--no-context-compression", description = "Disable context compression for this chat session.")
+        private boolean noContextCompression;
+
+        @Option(names = "--context-window-tokens", defaultValue = "128000", description = "Estimated context window tokens.")
+        private int contextWindowTokens;
+
+        @Option(names = "--max-output-tokens", defaultValue = "4000", description = "Estimated maximum output tokens.")
+        private int maxOutputTokens;
+
+        @Option(names = "--reserved-tokens", defaultValue = "13000", description = "Estimated reserved tokens for safety margin.")
+        private int reservedTokens;
+
         @Override
         public Integer call() throws IOException {
             AgentSession session;
@@ -300,11 +396,15 @@ public final class AgentCli implements Callable<Integer> {
                 ModelClient modelClient = createModelClient();
                 UserApprover userApprover = createUserApprover();
                 SkillCatalog skillCatalog = SkillCatalog.scanDefault();
-                ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog);
+                MemoryStore memoryStore = MemoryStore.defaultStore();
+                MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
+                printMemoryWarnings(memoryCatalog);
+                ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, memoryCatalog);
                 session = new AgentSession(new DefaultAgent(
                         modelClient,
                         toolRegistry,
-                        HookRegistry.defaultsFor(toolRegistry, userApprover)
+                        createHookRegistry(toolRegistry, userApprover, modelClient, memoryStore, memoryCatalog),
+                        createContextManager()
                 ));
             } catch (IllegalArgumentException | OpenAiCompatibleException e) {
                 spec.commandLine().getErr().println(e.getMessage());
@@ -396,6 +496,53 @@ public final class AgentCli implements Callable<Integer> {
             };
         }
 
+        private ContextManager createContextManager() {
+            if (noContextCompression) {
+                return ContextManager.disabled();
+            }
+            return ContextManager.withConfig(new ContextCompressionConfig(
+                    true,
+                    contextWindowTokens,
+                    maxOutputTokens,
+                    reservedTokens,
+                    ContextCompressionConfig.DEFAULT_TOOL_RESULT_BUDGET_CHARS,
+                    ContextCompressionConfig.DEFAULT_MAX_MESSAGES,
+                    ContextCompressionConfig.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
+                    ContextCompressionConfig.DEFAULT_RECENT_LOGICAL_ITEMS_AFTER_AUTO_COMPACT,
+                    ContextCompressionConfig.DEFAULT_REACTIVE_RECENT_LOGICAL_ITEMS,
+                    ContextCompressionConfig.DEFAULT_MAX_AUTO_COMPACT_FAILURES
+            ));
+        }
+
+        private HookRegistry createHookRegistry(
+                ToolRegistry toolRegistry,
+                UserApprover userApprover,
+                ModelClient modelClient,
+                MemoryStore memoryStore,
+                MemoryCatalog memoryCatalog
+        ) {
+            if (memoryWriteEnabled()) {
+                return HookRegistry.defaultsFor(
+                        toolRegistry,
+                        userApprover,
+                        memoryCatalog,
+                        new MemoryExtractor(modelClient),
+                        memoryStore
+                );
+            }
+            return HookRegistry.defaultsFor(toolRegistry, userApprover, memoryCatalog);
+        }
+
+        private boolean memoryWriteEnabled() {
+            return fixedModelClient == null && "openai-compatible".equals(provider);
+        }
+
+        private void printMemoryWarnings(MemoryCatalog memoryCatalog) {
+            for (String warning : memoryCatalog.warnings()) {
+                spec.commandLine().getErr().println("Memory warning: " + warning);
+            }
+        }
+
         private String resolveModel() {
             if (model != null && !model.isBlank()) {
                 return model.strip();
@@ -405,6 +552,89 @@ public final class AgentCli implements Callable<Integer> {
                 return environmentModel.strip();
             }
             return null;
+        }
+    }
+
+    @Command(
+            name = "memory",
+            description = "Inspect local persistent agent memory.",
+            subcommands = {MemoryListCommand.class, MemoryShowCommand.class}
+    )
+    static final class MemoryCommand implements Callable<Integer> {
+
+        @Spec
+        private CommandSpec spec;
+
+        @Override
+        public Integer call() {
+            spec.commandLine().usage(System.out);
+            return 0;
+        }
+    }
+
+    @Command(name = "list", description = "List local persistent memories.")
+    static final class MemoryListCommand implements Callable<Integer> {
+
+        private final Path workspace;
+
+        MemoryListCommand() {
+            this(Path.of(""));
+        }
+
+        MemoryListCommand(Path workspace) {
+            this.workspace = Objects.requireNonNull(workspace, "workspace must not be null");
+        }
+
+        @Spec
+        private CommandSpec spec;
+
+        @Override
+        public Integer call() {
+            MemoryCatalog catalog = MemoryCatalog.scan(workspace);
+            for (String warning : catalog.warnings()) {
+                spec.commandLine().getErr().println("Memory warning: " + warning);
+            }
+            if (catalog.isEmpty()) {
+                spec.commandLine().getOut().println("No memories.");
+                return 0;
+            }
+            spec.commandLine().getOut().println(catalog.renderIndex());
+            return 0;
+        }
+    }
+
+    @Command(name = "show", description = "Show one local persistent memory by name or file.")
+    static final class MemoryShowCommand implements Callable<Integer> {
+
+        private final Path workspace;
+
+        MemoryShowCommand() {
+            this(Path.of(""));
+        }
+
+        MemoryShowCommand(Path workspace) {
+            this.workspace = Objects.requireNonNull(workspace, "workspace must not be null");
+        }
+
+        @Spec
+        private CommandSpec spec;
+
+        @Parameters(paramLabel = "NAME_OR_FILE", description = "Memory name or .md file name.")
+        private String nameOrFile;
+
+        @Override
+        public Integer call() {
+            MemoryCatalog catalog = MemoryCatalog.scan(workspace);
+            for (String warning : catalog.warnings()) {
+                spec.commandLine().getErr().println("Memory warning: " + warning);
+            }
+            MemoryDefinition memory = catalog.find(nameOrFile);
+            if (memory == null) {
+                spec.commandLine().getErr().println("Memory not found: " + nameOrFile);
+                return CommandLine.ExitCode.USAGE;
+            }
+            spec.commandLine().getOut().println(memory.content());
+            return 0;
         }
     }
 }

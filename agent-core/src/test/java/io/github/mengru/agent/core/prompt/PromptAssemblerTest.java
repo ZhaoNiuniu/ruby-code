@@ -1,0 +1,214 @@
+package io.github.mengru.agent.core.prompt;
+
+import io.github.mengru.agent.api.AgentMemory;
+import io.github.mengru.agent.api.AgentRequest;
+import io.github.mengru.agent.api.ConversationMessage;
+import io.github.mengru.agent.core.memory.MemoryCatalog;
+import io.github.mengru.agent.core.skill.SkillCatalog;
+import io.github.mengru.agent.core.skill.SkillDefinition;
+import io.github.mengru.agent.core.tool.ToolRegistry;
+import io.github.mengru.agent.core.tool.todo.TodoWriteTool;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class PromptAssemblerTest {
+
+    @TempDir
+    Path workspace;
+
+    @Test
+    void mainPromptIncludesStableRuntimeSections() {
+        ToolRegistry tools = ToolRegistry.defaultToolsWithSkills(skillCatalog());
+        AgentRequest request = new AgentRequest(
+                "change code",
+                8,
+                Map.of("trace", "abc"),
+                "Prefer small diffs.",
+                List.of(ConversationMessage.user("previous")),
+                AgentMemory.of("## Goal\n\nKeep the session coherent.")
+        );
+
+        AgentRequest assembled = assemble(PromptMode.MAIN, tools, MemoryCatalog.empty(workspace), skillCatalog(), request);
+
+        assertThat(assembled.systemPrompt()).contains("## identity");
+        assertThat(assembled.systemPrompt()).contains("command-line agent");
+        assertThat(assembled.systemPrompt()).contains("## user_instructions");
+        assertThat(assembled.systemPrompt()).contains("Prefer small diffs.");
+        assertThat(assembled.systemPrompt()).contains("## workspace");
+        assertThat(assembled.systemPrompt()).contains(workspace.toAbsolutePath().normalize().toString());
+        assertThat(assembled.systemPrompt()).contains("## tools");
+        assertThat(assembled.systemPrompt()).contains("todo_write");
+        assertThat(assembled.systemPrompt()).contains("## skill_catalog");
+        assertThat(assembled.systemPrompt()).contains("java-agent: Java agent guidance");
+        assertThat(assembled.systemPrompt()).contains("## todo_planning");
+        assertThat(assembled.systemPrompt()).contains("## session_memory");
+        assertThat(assembled.systemPrompt()).contains("Keep the session coherent");
+        assertThat(assembled.metadata()).containsEntry("trace", "abc");
+        assertThat(assembled.conversationHistory()).containsExactly(ConversationMessage.user("previous"));
+        assertThat(assembled.memory().markdown()).contains("Keep the session coherent");
+    }
+
+    @Test
+    void memoryIndexIsSystemSectionAndRelevantMemoryIsUserTurnContext() throws IOException {
+        writeMemory("style.md", "tab-style", "Use tab indentation", "user", "Use tabs instead of spaces.");
+        MemoryCatalog catalog = MemoryCatalog.scan(workspace);
+
+        AgentRequest assembled = assemble(
+                PromptMode.MAIN,
+                ToolRegistry.builder().add(new TodoWriteTool()).build(),
+                catalog,
+                SkillCatalog.empty(),
+                AgentRequest.of("please update indentation style with tabs")
+        );
+
+        assertThat(assembled.systemPrompt()).contains("## persistent_memory_index");
+        assertThat(assembled.systemPrompt()).contains("tab-style");
+        assertThat(assembled.systemPrompt()).doesNotContain("Use tabs instead of spaces.");
+        assertThat(assembled.task()).contains("## Relevant Long-Term Memory");
+        assertThat(assembled.task()).contains("Use tabs instead of spaces.");
+    }
+
+    @Test
+    void repeatedAssemblyIsIdempotentAndUsesCache() throws IOException {
+        writeMemory("style.md", "tab-style", "Use tab indentation", "user", "Use tabs instead of spaces.");
+        MemoryCatalog catalog = MemoryCatalog.scan(workspace);
+        PromptAssembler assembler = new PromptAssembler();
+        AgentRequest request = AgentRequest.of("please update indentation style with tabs");
+
+        AgentRequest first = assembler.assemble(context(
+                PromptMode.MAIN,
+                ToolRegistry.defaultTools(),
+                catalog,
+                SkillCatalog.empty(),
+                request
+        ));
+        AgentRequest second = assembler.assemble(context(
+                PromptMode.MAIN,
+                ToolRegistry.defaultTools(),
+                catalog,
+                SkillCatalog.empty(),
+                first
+        ));
+
+        assertThat(second.systemPrompt()).isEqualTo(first.systemPrompt());
+        assertThat(second.task()).isEqualTo(first.task());
+        assertThat(assembler.cacheSize()).isEqualTo(1);
+        assertThat(assembler.cacheHits()).isEqualTo(1);
+    }
+
+    @Test
+    void changedSessionMemoryMissesCache() {
+        PromptAssembler assembler = new PromptAssembler();
+        ToolRegistry tools = ToolRegistry.defaultTools();
+
+        assembler.assemble(context(
+                PromptMode.MAIN,
+                tools,
+                MemoryCatalog.empty(workspace),
+                SkillCatalog.empty(),
+                AgentRequest.of("task").withMemory(AgentMemory.of("first"))
+        ));
+        assembler.assemble(context(
+                PromptMode.MAIN,
+                tools,
+                MemoryCatalog.empty(workspace),
+                SkillCatalog.empty(),
+                AgentRequest.of("task").withMemory(AgentMemory.of("second"))
+        ));
+
+        assertThat(assembler.cacheSize()).isEqualTo(2);
+        assertThat(assembler.cacheHits()).isZero();
+    }
+
+    @Test
+    void subagentPromptUsesSubagentIdentityAndExpectedOutput() {
+        AgentRequest request = new AgentRequest(
+                "trace call chain",
+                6,
+                Map.of(PromptAssembler.SUBAGENT_EXPECTED_OUTPUT_METADATA_KEY, "Include files touched."),
+                "Prefer short reports."
+        );
+
+        AgentRequest assembled = assemble(
+                PromptMode.SUBAGENT,
+                ToolRegistry.investigationTools(),
+                MemoryCatalog.empty(workspace),
+                SkillCatalog.empty(),
+                request
+        );
+
+        assertThat(assembled.systemPrompt()).contains("## identity");
+        assertThat(assembled.systemPrompt()).contains("investigation subagent");
+        assertThat(assembled.systemPrompt()).contains("## user_instructions");
+        assertThat(assembled.systemPrompt()).contains("Prefer short reports.");
+        assertThat(assembled.systemPrompt()).contains("## subagent_expected_output");
+        assertThat(assembled.systemPrompt()).contains("Include files touched.");
+        assertThat(assembled.systemPrompt()).contains("read_file");
+        assertThat(assembled.systemPrompt()).doesNotContain("write_file");
+        assertThat(assembled.systemPrompt()).doesNotContain("Parent agent system prompt");
+    }
+
+    private AgentRequest assemble(
+            PromptMode mode,
+            ToolRegistry tools,
+            MemoryCatalog memoryCatalog,
+            SkillCatalog skillCatalog,
+            AgentRequest request
+    ) {
+        return new PromptAssembler().assemble(context(mode, tools, memoryCatalog, skillCatalog, request));
+    }
+
+    private PromptAssemblyContext context(
+            PromptMode mode,
+            ToolRegistry tools,
+            MemoryCatalog memoryCatalog,
+            SkillCatalog skillCatalog,
+            AgentRequest request
+    ) {
+        String userInstructions = request.metadata().getOrDefault(PromptAssembler.USER_INSTRUCTIONS_METADATA_KEY, request.systemPrompt());
+        String originalTask = request.metadata().getOrDefault(PromptAssembler.ORIGINAL_TASK_METADATA_KEY, request.task());
+        return new PromptAssemblyContext(
+                mode,
+                request,
+                tools,
+                memoryCatalog,
+                skillCatalog,
+                workspace,
+                userInstructions,
+                originalTask,
+                request.metadata().getOrDefault(PromptAssembler.SUBAGENT_EXPECTED_OUTPUT_METADATA_KEY, "")
+        );
+    }
+
+    private static SkillCatalog skillCatalog() {
+        return SkillCatalog.of(List.of(new SkillDefinition(
+                "java-agent",
+                "Java agent guidance",
+                Path.of("skills/java-agent/SKILL.md"),
+                "content"
+        )));
+    }
+
+    private void writeMemory(String fileName, String name, String description, String type, String body) throws IOException {
+        Path memoryDir = workspace.resolve(".memory");
+        Files.createDirectories(memoryDir);
+        Files.writeString(memoryDir.resolve(fileName), """
+                ---
+                name: %s
+                description: %s
+                type: %s
+                ---
+                
+                %s
+                """.formatted(name, description, type, body), StandardCharsets.UTF_8);
+    }
+}

@@ -9,13 +9,12 @@ public record AgentRequest(
         int maxSteps,
         Map<String, String> metadata,
         String systemPrompt,
-        List<ConversationMessage> conversationHistory
+        List<ConversationMessage> conversationHistory,
+        AgentMemory memory
 ) {
 
     private static final int DEFAULT_MAX_STEPS = 8;
-    private static final String DEFAULT_SYSTEM_PROMPT = """
-            You are a concise, capable agent. Use available tools when they help, then provide a final answer.
-            """.strip();
+    private static final String DEFAULT_SYSTEM_PROMPT = "";
 
     public AgentRequest(String task, int maxSteps, Map<String, String> metadata) {
         this(task, maxSteps, metadata, DEFAULT_SYSTEM_PROMPT, List.of());
@@ -25,10 +24,21 @@ public record AgentRequest(
         this(task, maxSteps, metadata, systemPrompt, List.of());
     }
 
+    public AgentRequest(
+            String task,
+            int maxSteps,
+            Map<String, String> metadata,
+            String systemPrompt,
+            List<ConversationMessage> conversationHistory
+    ) {
+        this(task, maxSteps, metadata, systemPrompt, conversationHistory, AgentMemory.empty());
+    }
+
     public AgentRequest {
         Objects.requireNonNull(task, "task must not be null");
         Objects.requireNonNull(metadata, "metadata must not be null");
         Objects.requireNonNull(conversationHistory, "conversationHistory must not be null");
+        memory = memory == null ? AgentMemory.empty() : memory;
         systemPrompt = systemPrompt == null ? "" : systemPrompt.strip();
         if (task.isBlank()) {
             throw new IllegalArgumentException("task must not be blank");
@@ -46,5 +56,9 @@ public record AgentRequest(
 
     public static AgentRequest of(String task, String systemPrompt) {
         return new AgentRequest(task, DEFAULT_MAX_STEPS, Map.of(), systemPrompt);
+    }
+
+    public AgentRequest withMemory(AgentMemory newMemory) {
+        return new AgentRequest(task, maxSteps, metadata, systemPrompt, conversationHistory, newMemory);
     }
 }

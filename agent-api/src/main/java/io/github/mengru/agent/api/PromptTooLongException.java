@@ -1,12 +1,12 @@
 package io.github.mengru.agent.api;
 
-public class PromptTooLongException extends RuntimeException {
+public class PromptTooLongException extends ModelException {
 
     public PromptTooLongException(String message) {
-        super(message);
+        super(ModelErrorCode.PROMPT_TOO_LONG, message);
     }
 
     public PromptTooLongException(String message, Throwable cause) {
-        super(message, cause);
+        super(ModelErrorCode.PROMPT_TOO_LONG, message, cause);
     }
 }

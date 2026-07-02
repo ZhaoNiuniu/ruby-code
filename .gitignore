@@ -1,2 +1,5 @@
 .memory/
 MEMORY.md
+.scheduled_tasks.json
+.tasks/.lock
+.teams/

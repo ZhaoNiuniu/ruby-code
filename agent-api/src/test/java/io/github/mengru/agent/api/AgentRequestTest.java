@@ -21,6 +21,8 @@ class AgentRequestTest {
         assertThat(request.systemPrompt()).isEmpty();
         assertThat(request.conversationHistory()).isEmpty();
         assertThat(request.memory().isEmpty()).isTrue();
+        assertThat(request.modelOptions().maxOutputTokens()).isEqualTo(8192);
+        assertThat(request.notifications()).isEmpty();
     }
 
     @Test
@@ -70,6 +72,53 @@ class AgentRequestTest {
     }
 
     @Test
+    void supportsExplicitModelOptions() {
+        AgentRequest request = AgentRequest.of("run")
+                .withModelOptions(new ModelOptions(1234));
+
+        assertThat(request.modelOptions().maxOutputTokens()).isEqualTo(1234);
+        assertThat(request.withTask("other").modelOptions().maxOutputTokens()).isEqualTo(1234);
+    }
+
+    @Test
+    void copiesBackgroundTaskNotifications() {
+        List<BackgroundTaskNotification> notifications = new ArrayList<>();
+        notifications.add(new BackgroundTaskNotification("bg_1", "bash", "completed", "done"));
+
+        AgentRequest request = AgentRequest.of("run").withNotifications(notifications);
+        notifications.clear();
+
+        assertThat(request.notifications()).hasSize(1);
+        assertThatThrownBy(() -> request.notifications().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void createsTaskNotificationStepWithoutToolCallId() {
+        AgentStep step = AgentStep.taskNotification(
+                new BackgroundTaskNotification("bg_1", "bash", "completed", "done")
+        );
+
+        assertThat(step.type()).isEqualTo(AgentStep.Type.TASK_NOTIFICATION);
+        assertThat(step.toolCallIdOptional()).isEmpty();
+        assertThat(step.content()).contains("<task_notification");
+        assertThat(step.content()).contains("bg_1");
+    }
+
+    @Test
+    void agentStepCopiesMetadata() {
+        Map<String, String> metadata = new java.util.LinkedHashMap<>();
+        metadata.put("provider.reasoning", "think");
+
+        AgentStep step = AgentStep.finalAnswer("ok", metadata);
+        metadata.clear();
+
+        assertThat(step.metadata()).containsEntry("provider.reasoning", "think");
+        assertThatThrownBy(() -> step.metadata().put("other", "value"))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
     void agentResultCopiesCompressionEvents() {
         List<ContextCompressionEvent> events = new ArrayList<>();
         events.add(new ContextCompressionEvent(
@@ -86,5 +135,46 @@ class AgentRequestTest {
         assertThat(result.compressionEvents()).hasSize(1);
         assertThatThrownBy(() -> result.compressionEvents().clear())
                 .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void agentResultCopiesRecoveryEvents() {
+        List<AgentRecoveryEvent> events = new ArrayList<>();
+        events.add(new AgentRecoveryEvent(
+                ModelErrorCode.TRANSIENT,
+                "retry",
+                1,
+                true,
+                8192,
+                8192,
+                "ok"
+        ));
+
+        AgentResult result = new AgentResult("ok", List.of(), true, List.of(), events);
+        events.clear();
+
+        assertThat(result.recoveryEvents()).hasSize(1);
+        assertThatThrownBy(() -> result.recoveryEvents().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void agentResultCopiesTraceEvents() {
+        List<TraceEvent> events = new ArrayList<>();
+        events.add(TraceEvent.of(TraceEvent.Type.MODEL_CALL, Map.of("status", "start")));
+
+        AgentResult result = new AgentResult("ok", List.of(), true, List.of(), List.of(), events);
+        events.clear();
+
+        assertThat(result.traceEvents()).hasSize(1);
+        assertThatThrownBy(() -> result.traceEvents().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void promptTooLongExceptionIsTypedModelException() {
+        PromptTooLongException exception = new PromptTooLongException("too long");
+
+        assertThat(exception.code()).isEqualTo(ModelErrorCode.PROMPT_TOO_LONG);
     }
 }

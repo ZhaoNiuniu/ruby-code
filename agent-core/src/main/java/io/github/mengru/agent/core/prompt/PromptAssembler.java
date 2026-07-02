@@ -16,6 +16,9 @@ public final class PromptAssembler {
     public static final String ORIGINAL_TASK_METADATA_KEY = "agent.originalTask";
     public static final String USER_INSTRUCTIONS_METADATA_KEY = "agent.userInstructions";
     public static final String SUBAGENT_EXPECTED_OUTPUT_METADATA_KEY = "agent.subagentExpectedOutput";
+    public static final String PROVIDER_METADATA_KEY = "agent.provider";
+    public static final String MODEL_METADATA_KEY = "agent.model";
+    public static final String BASE_URL_METADATA_KEY = "agent.baseUrl";
 
     private static final String RELEVANT_MEMORY_MARKER = "## Relevant Long-Term Memory";
     private static final int MAX_RELEVANT_MEMORY_CHARS = 12_000;
@@ -51,7 +54,9 @@ public final class PromptAssembler {
                 metadata,
                 systemPrompt,
                 context.request().conversationHistory(),
-                context.request().memory()
+                context.request().memory(),
+                context.request().modelOptions(),
+                context.request().notifications()
         );
     }
 
@@ -120,7 +125,9 @@ public final class PromptAssembler {
                 context.request().metadata(),
                 context.userInstructions(),
                 context.request().conversationHistory(),
-                context.request().memory()
+                context.request().memory(),
+                context.request().modelOptions(),
+                context.request().notifications()
         );
     }
 
@@ -141,6 +148,9 @@ public final class PromptAssembler {
         StringBuilder builder = new StringBuilder()
                 .append("mode=").append(context.mode()).append('\n')
                 .append("userInstructions=").append(context.userInstructions()).append('\n')
+                .append("provider=").append(context.request().metadata().getOrDefault(PROVIDER_METADATA_KEY, "")).append('\n')
+                .append("model=").append(context.request().metadata().getOrDefault(MODEL_METADATA_KEY, "")).append('\n')
+                .append("baseUrl=").append(context.request().metadata().getOrDefault(BASE_URL_METADATA_KEY, "")).append('\n')
                 .append("workspace=").append(context.workspace()).append('\n')
                 .append("memory=").append(context.request().memory().markdown()).append('\n')
                 .append("memoryIndex=").append(context.memoryCatalog().renderIndex()).append('\n')

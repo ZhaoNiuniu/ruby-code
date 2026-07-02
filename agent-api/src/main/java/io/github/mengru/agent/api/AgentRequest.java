@@ -10,7 +10,9 @@ public record AgentRequest(
         Map<String, String> metadata,
         String systemPrompt,
         List<ConversationMessage> conversationHistory,
-        AgentMemory memory
+        AgentMemory memory,
+        ModelOptions modelOptions,
+        List<BackgroundTaskNotification> notifications
 ) {
 
     private static final int DEFAULT_MAX_STEPS = 8;
@@ -34,11 +36,36 @@ public record AgentRequest(
         this(task, maxSteps, metadata, systemPrompt, conversationHistory, AgentMemory.empty());
     }
 
+    public AgentRequest(
+            String task,
+            int maxSteps,
+            Map<String, String> metadata,
+            String systemPrompt,
+            List<ConversationMessage> conversationHistory,
+            AgentMemory memory
+    ) {
+        this(task, maxSteps, metadata, systemPrompt, conversationHistory, memory, ModelOptions.defaults());
+    }
+
+    public AgentRequest(
+            String task,
+            int maxSteps,
+            Map<String, String> metadata,
+            String systemPrompt,
+            List<ConversationMessage> conversationHistory,
+            AgentMemory memory,
+            ModelOptions modelOptions
+    ) {
+        this(task, maxSteps, metadata, systemPrompt, conversationHistory, memory, modelOptions, List.of());
+    }
+
     public AgentRequest {
         Objects.requireNonNull(task, "task must not be null");
         Objects.requireNonNull(metadata, "metadata must not be null");
         Objects.requireNonNull(conversationHistory, "conversationHistory must not be null");
         memory = memory == null ? AgentMemory.empty() : memory;
+        modelOptions = modelOptions == null ? ModelOptions.defaults() : modelOptions;
+        notifications = notifications == null ? List.of() : notifications;
         systemPrompt = systemPrompt == null ? "" : systemPrompt.strip();
         if (task.isBlank()) {
             throw new IllegalArgumentException("task must not be blank");
@@ -48,6 +75,7 @@ public record AgentRequest(
         }
         metadata = Map.copyOf(metadata);
         conversationHistory = List.copyOf(conversationHistory);
+        notifications = List.copyOf(notifications);
     }
 
     public static AgentRequest of(String task) {
@@ -59,6 +87,18 @@ public record AgentRequest(
     }
 
     public AgentRequest withMemory(AgentMemory newMemory) {
-        return new AgentRequest(task, maxSteps, metadata, systemPrompt, conversationHistory, newMemory);
+        return new AgentRequest(task, maxSteps, metadata, systemPrompt, conversationHistory, newMemory, modelOptions, notifications);
+    }
+
+    public AgentRequest withModelOptions(ModelOptions newModelOptions) {
+        return new AgentRequest(task, maxSteps, metadata, systemPrompt, conversationHistory, memory, newModelOptions, notifications);
+    }
+
+    public AgentRequest withTask(String newTask) {
+        return new AgentRequest(newTask, maxSteps, metadata, systemPrompt, conversationHistory, memory, modelOptions, notifications);
+    }
+
+    public AgentRequest withNotifications(List<BackgroundTaskNotification> newNotifications) {
+        return new AgentRequest(task, maxSteps, metadata, systemPrompt, conversationHistory, memory, modelOptions, newNotifications);
     }
 }

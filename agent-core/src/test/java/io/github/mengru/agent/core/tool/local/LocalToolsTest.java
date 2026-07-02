@@ -132,6 +132,13 @@ class LocalToolsTest {
     }
 
     @Test
+    void bashSchemaIncludesBackgroundFlag() {
+        assertThat(new BashTool(workspace).parametersSchema()
+                .at("/properties/run_in_background/type")
+                .asText()).isEqualTo("boolean");
+    }
+
+    @Test
     void bashNonZeroExitIsToolFailureWithOutput() {
         ToolResult result = new BashTool(workspace).execute(request("bash", args()
                 .put("command", "printf bad >&2; exit 7")));

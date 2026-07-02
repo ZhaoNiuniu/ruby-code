@@ -16,6 +16,7 @@ import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.prompt.PromptAssembler;
 import io.github.mengru.agent.core.prompt.PromptMode;
 import io.github.mengru.agent.core.skill.SkillCatalog;
+import io.github.mengru.agent.core.task.TaskManager;
 import io.github.mengru.agent.core.tool.ToolRegistry;
 
 import java.util.Map;
@@ -35,6 +36,7 @@ public final class SubagentTool implements Tool {
     private final UserApprover userApprover;
     private final SkillCatalog skillCatalog;
     private final MemoryCatalog memoryCatalog;
+    private final TaskManager taskManager;
 
     public SubagentTool(ModelClient modelClient, UserApprover userApprover) {
         this(modelClient, userApprover, SkillCatalog.empty());
@@ -45,10 +47,21 @@ public final class SubagentTool implements Tool {
     }
 
     public SubagentTool(ModelClient modelClient, UserApprover userApprover, SkillCatalog skillCatalog, MemoryCatalog memoryCatalog) {
+        this(modelClient, userApprover, skillCatalog, memoryCatalog, TaskManager.defaultManager());
+    }
+
+    public SubagentTool(
+            ModelClient modelClient,
+            UserApprover userApprover,
+            SkillCatalog skillCatalog,
+            MemoryCatalog memoryCatalog,
+            TaskManager taskManager
+    ) {
         this.modelClient = Objects.requireNonNull(modelClient, "modelClient must not be null");
         this.userApprover = Objects.requireNonNull(userApprover, "userApprover must not be null");
         this.skillCatalog = Objects.requireNonNull(skillCatalog, "skillCatalog must not be null");
         this.memoryCatalog = Objects.requireNonNull(memoryCatalog, "memoryCatalog must not be null");
+        this.taskManager = Objects.requireNonNull(taskManager, "taskManager must not be null");
     }
 
     @Override
@@ -97,7 +110,7 @@ public final class SubagentTool implements Tool {
         } catch (IllegalArgumentException e) {
             return ToolResult.failure(e.getMessage());
         }
-        ToolRegistry childTools = ToolRegistry.investigationTools(skillCatalog);
+        ToolRegistry childTools = ToolRegistry.investigationTools(skillCatalog, taskManager);
         DefaultAgent childAgent = new DefaultAgent(
                 modelClient,
                 childTools,

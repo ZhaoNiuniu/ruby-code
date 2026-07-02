@@ -9,6 +9,8 @@ import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentStep;
 import io.github.mengru.agent.api.ConversationMessage;
 import io.github.mengru.agent.api.ModelClient;
+import io.github.mengru.agent.api.ModelErrorCode;
+import io.github.mengru.agent.api.ModelException;
 import io.github.mengru.agent.api.PromptTooLongException;
 import io.github.mengru.agent.api.Tool;
 
@@ -17,9 +19,11 @@ import java.net.InetSocketAddress;
 import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -29,6 +33,7 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
 
     public static final String DEFAULT_BASE_URL = "https://api.openai.com/v1";
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(60);
+    public static final String REASONING_CONTENT_METADATA_KEY = "openai.reasoning_content";
 
     private final String model;
     private final String apiKey;
@@ -92,16 +97,27 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
         try {
             response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
         } catch (IOException e) {
-            throw new OpenAiCompatibleException("OpenAI-compatible request failed: " + e.getMessage(), e);
+            throw new ModelException(ModelErrorCode.TRANSIENT, "OpenAI-compatible request failed: " + e.getMessage(), e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new OpenAiCompatibleException("OpenAI-compatible request was interrupted.", e);
+            throw new ModelException(ModelErrorCode.TRANSIENT, "OpenAI-compatible request was interrupted.", e);
         }
 
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             if (isPromptTooLong(response.statusCode(), response.body())) {
                 throw new PromptTooLongException("OpenAI-compatible request prompt is too long: HTTP "
                         + response.statusCode() + ": " + response.body());
+            }
+            if (isTransientStatus(response.statusCode())) {
+                throw new ModelException(
+                        ModelErrorCode.TRANSIENT,
+                        "OpenAI-compatible request failed with transient HTTP "
+                                + response.statusCode() + ": " + response.body(),
+                        null,
+                        response.statusCode(),
+                        retryAfter(response.headers()),
+                        ""
+                );
             }
             throw new OpenAiCompatibleException("OpenAI-compatible request failed with HTTP "
                     + response.statusCode() + ": " + response.body());
@@ -112,6 +128,7 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
     private ObjectNode buildRequestBody(AgentRequest request, List<AgentStep> previousSteps, List<Tool> tools) {
         ObjectNode root = objectMapper.createObjectNode();
         root.put("model", model);
+        root.put("max_tokens", request.modelOptions().maxOutputTokens());
         root.set("messages", buildMessages(request, previousSteps));
         if (!tools.isEmpty()) {
             root.set("tools", buildTools(tools));
@@ -142,7 +159,8 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
             switch (step.type()) {
                 case TOOL_CALL -> messages.add(toolCallMessage(step));
                 case TOOL_RESULT -> messages.add(toolResultMessage(step));
-                case FINAL_ANSWER, THOUGHT, ERROR -> messages.add(assistantMessage(step.content()));
+                case TASK_NOTIFICATION -> messages.add(userMessage(step.content()));
+                case FINAL_ANSWER, THOUGHT, ERROR -> messages.add(assistantMessage(step));
             }
         }
         return messages;
@@ -166,6 +184,7 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
         ObjectNode message = objectMapper.createObjectNode();
         message.put("role", "assistant");
         message.putNull("content");
+        putReasoningContentIfPresent(message, step);
         ArrayNode toolCalls = message.putArray("tool_calls");
         ObjectNode toolCall = toolCalls.addObject();
         toolCall.put("id", step.toolCallIdOptional().orElse("call_unknown"));
@@ -187,11 +206,31 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
         return message;
     }
 
+    private ObjectNode userMessage(String content) {
+        ObjectNode message = objectMapper.createObjectNode();
+        message.put("role", "user");
+        message.put("content", content == null ? "" : content);
+        return message;
+    }
+
     private ObjectNode assistantMessage(String content) {
         ObjectNode message = objectMapper.createObjectNode();
         message.put("role", "assistant");
         message.put("content", content == null ? "" : content);
         return message;
+    }
+
+    private ObjectNode assistantMessage(AgentStep step) {
+        ObjectNode message = assistantMessage(step.content());
+        putReasoningContentIfPresent(message, step);
+        return message;
+    }
+
+    private void putReasoningContentIfPresent(ObjectNode message, AgentStep step) {
+        String reasoningContent = step.metadata().get(REASONING_CONTENT_METADATA_KEY);
+        if (reasoningContent != null && !reasoningContent.isBlank()) {
+            message.put("reasoning_content", reasoningContent);
+        }
     }
 
     private ArrayNode buildTools(List<Tool> tools) {
@@ -212,15 +251,29 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
         try {
             root = objectMapper.readTree(body);
         } catch (JsonProcessingException e) {
-            throw new OpenAiCompatibleException("Failed to parse OpenAI-compatible response JSON.", e);
+            throw new ModelException(ModelErrorCode.NON_RETRYABLE, "Failed to parse OpenAI-compatible response JSON.", e);
         }
 
         JsonNode choices = root.path("choices");
         if (!choices.isArray() || choices.isEmpty()) {
-            throw new OpenAiCompatibleException("OpenAI-compatible response did not include choices.");
+            throw new ModelException(ModelErrorCode.NON_RETRYABLE, "OpenAI-compatible response did not include choices.");
         }
 
-        JsonNode message = choices.get(0).path("message");
+        JsonNode choice = choices.get(0);
+        String finishReason = choice.path("finish_reason").asText("");
+        JsonNode message = choice.path("message");
+        if (isOutputTruncated(finishReason)) {
+            String partial = message.path("content").asText("");
+            throw new ModelException(
+                    ModelErrorCode.OUTPUT_TRUNCATED,
+                    "OpenAI-compatible response was truncated by max_tokens.",
+                    null,
+                    -1,
+                    null,
+                    partial
+            );
+        }
+
         JsonNode toolCalls = message.path("tool_calls");
         if (toolCalls.isArray() && !toolCalls.isEmpty()) {
             JsonNode toolCall = toolCalls.get(0);
@@ -228,10 +281,19 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
             JsonNode function = toolCall.path("function");
             String name = textValue(function, "name");
             JsonNode arguments = parseToolArguments(function.path("arguments").asText("{}"));
-            return AgentStep.toolCall(id, name, arguments);
+            return AgentStep.toolCall(id, name, arguments, assistantMetadata(message));
         }
 
-        return AgentStep.finalAnswer(message.path("content").asText(""));
+        return AgentStep.finalAnswer(message.path("content").asText(""), assistantMetadata(message));
+    }
+
+    private Map<String, String> assistantMetadata(JsonNode message) {
+        LinkedHashMap<String, String> metadata = new LinkedHashMap<>();
+        JsonNode reasoningContent = message.get("reasoning_content");
+        if (reasoningContent != null && !reasoningContent.isNull() && !reasoningContent.asText("").isBlank()) {
+            metadata.put(REASONING_CONTENT_METADATA_KEY, reasoningContent.asText());
+        }
+        return Map.copyOf(metadata);
     }
 
     private JsonNode parseToolArguments(String arguments) {
@@ -241,7 +303,7 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
         try {
             return objectMapper.readTree(arguments);
         } catch (JsonProcessingException e) {
-            throw new OpenAiCompatibleException("Failed to parse tool call arguments JSON.", e);
+            throw new ModelException(ModelErrorCode.NON_RETRYABLE, "Failed to parse tool call arguments JSON.", e);
         }
     }
 
@@ -321,10 +383,41 @@ public final class OpenAiCompatibleModelClient implements ModelClient {
                 || normalized.contains("maximum context");
     }
 
+    private boolean isTransientStatus(int statusCode) {
+        return statusCode == 429
+                || statusCode == 529
+                || statusCode == 500
+                || statusCode == 502
+                || statusCode == 503
+                || statusCode == 504;
+    }
+
+    private boolean isOutputTruncated(String finishReason) {
+        return "length".equals(finishReason) || "max_tokens".equals(finishReason);
+    }
+
+    private Duration retryAfter(HttpHeaders headers) {
+        return headers.firstValue("Retry-After")
+                .flatMap(this::parseRetryAfter)
+                .orElse(null);
+    }
+
+    private Optional<Duration> parseRetryAfter(String value) {
+        try {
+            long seconds = Long.parseLong(value.strip());
+            if (seconds < 0) {
+                return Optional.empty();
+            }
+            return Optional.of(Duration.ofSeconds(seconds));
+        } catch (NumberFormatException e) {
+            return Optional.empty();
+        }
+    }
+
     private static String textValue(JsonNode node, String field) {
         JsonNode value = node.path(field);
         if (value.isMissingNode() || value.asText().isBlank()) {
-            throw new OpenAiCompatibleException("OpenAI-compatible response is missing field: " + field);
+            throw new ModelException(ModelErrorCode.NON_RETRYABLE, "OpenAI-compatible response is missing field: " + field);
         }
         return value.asText();
     }

@@ -6,36 +6,23 @@ import io.github.mengru.agent.api.Tool;
 import io.github.mengru.agent.api.ToolRequest;
 import io.github.mengru.agent.api.ToolResult;
 
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.util.List;
-import java.util.Locale;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Pattern;
 
 public final class BashTool implements Tool {
 
     private static final int DEFAULT_TIMEOUT_SECONDS = 30;
     private static final int MAX_TIMEOUT_SECONDS = 120;
+    private static final int DEFAULT_BACKGROUND_TIMEOUT_SECONDS = 1_800;
+    private static final int MAX_BACKGROUND_TIMEOUT_SECONDS = 1_800;
 
-    private static final List<Pattern> REJECTED_PATTERNS = List.of(
-            Pattern.compile("(?is)(^|\\s)rm\\s+[^\\n;]*(?:-[^\\n;]*r|--recursive)"),
-            Pattern.compile("(?is)(^|\\s)(sudo|su|shutdown|reboot|halt)($|\\s)"),
-            Pattern.compile("(?is)(^|\\s)(chmod|chown)\\s+[^\\n;]*(?:/|\\.\\.)"),
-            Pattern.compile("(?is)(^|\\s)(mkfs|dd)($|\\s)")
-    );
-
-    private final Path workspaceRoot;
+    private final BashCommandRunner runner;
 
     public BashTool() {
         this(LocalToolSupport.defaultWorkspaceRoot());
     }
 
     public BashTool(Path workspaceRoot) {
-        this.workspaceRoot = LocalToolSupport.normalizeWorkspace(workspaceRoot);
+        this.runner = new BashCommandRunner(workspaceRoot);
     }
 
     @Override
@@ -53,96 +40,18 @@ public final class BashTool implements Tool {
         ObjectNode schema = LocalToolSupport.objectSchema();
         ObjectNode properties = (ObjectNode) schema.get("properties");
         properties.set("command", LocalToolSupport.stringProperty("Shell command to run non-interactively."));
-        properties.set("timeoutSeconds", LocalToolSupport.integerProperty("Timeout in seconds. Defaults to 30, maximum 120.", 1, MAX_TIMEOUT_SECONDS));
+        properties.set("timeoutSeconds", LocalToolSupport.integerProperty("Timeout in seconds. Foreground defaults to 30 and maxes at 120; chat background defaults to 1800 and maxes at 1800.", 1, MAX_BACKGROUND_TIMEOUT_SECONDS));
+        properties.set("run_in_background", LocalToolSupport.booleanProperty("In agent chat, run obvious long-running commands in the background and return a bg_id immediately. agent run ignores this and executes foreground."));
         schema.putArray("required").add("command");
         return schema;
     }
 
     @Override
     public ToolResult execute(ToolRequest request) {
-        String command = request.stringArgument("command");
-        if (command.isBlank()) {
-            return ToolResult.failure("command must not be blank");
-        }
-
-        String rejection = rejectionReason(command);
-        if (!rejection.isEmpty()) {
-            return ToolResult.failure(rejection);
-        }
-
-        int timeoutSeconds = LocalToolSupport.intArgument(request.arguments(), "timeoutSeconds", DEFAULT_TIMEOUT_SECONDS);
-        if (timeoutSeconds < 1 || timeoutSeconds > MAX_TIMEOUT_SECONDS) {
-            return ToolResult.failure("timeoutSeconds must be between 1 and " + MAX_TIMEOUT_SECONDS);
-        }
-
-        ProcessBuilder builder = new ProcessBuilder("bash", "-lc", command);
-        builder.directory(workspaceRoot.toFile());
-        try {
-            Process process = builder.start();
-            CompletableFuture<String> stdout = CompletableFuture.supplyAsync(() -> read(process.getInputStream()));
-            CompletableFuture<String> stderr = CompletableFuture.supplyAsync(() -> read(process.getErrorStream()));
-            boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                return ToolResult.failure("command timed out after " + timeoutSeconds + " seconds");
-            }
-            int exitCode = process.exitValue();
-            String output = "exitCode: " + exitCode
-                    + "\nstdout:\n" + stdout.get()
-                    + "\nstderr:\n" + stderr.get();
-            return exitCode == 0
-                    ? ToolResult.success(LocalToolSupport.truncate(output))
-                    : ToolResult.failure(LocalToolSupport.truncate(output));
-        } catch (IOException e) {
-            return ToolResult.failure("failed to start command: " + e.getMessage());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return ToolResult.failure("command interrupted");
-        } catch (ExecutionException e) {
-            return ToolResult.failure("failed to read command output: " + e.getMessage());
-        }
+        return runner.run(request.arguments(), DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
     }
 
-    private String rejectionReason(String command) {
-        String lower = command.toLowerCase(Locale.ROOT);
-        if (lower.contains("read ") || lower.startsWith("read") || lower.contains(" -it ") || lower.contains("--interactive")) {
-            return "interactive commands are not allowed";
-        }
-        if (command.contains("..")) {
-            return "command must not reference parent paths";
-        }
-        for (Pattern pattern : REJECTED_PATTERNS) {
-            if (pattern.matcher(command).find()) {
-                return "command rejected by local safety guard";
-            }
-        }
-
-        String root = workspaceRoot.toString();
-        for (String token : command.split("\\s+")) {
-            String cleaned = cleanToken(token);
-            if (cleaned.startsWith("/") && !cleaned.equals(root) && !cleaned.startsWith(root + "/")) {
-                return "absolute paths outside the workspace are not allowed: " + cleaned;
-            }
-        }
-        return "";
-    }
-
-    private static String cleanToken(String token) {
-        String cleaned = token;
-        while (!cleaned.isEmpty() && "'\"([{".indexOf(cleaned.charAt(0)) >= 0) {
-            cleaned = cleaned.substring(1);
-        }
-        while (!cleaned.isEmpty() && "'\".,;:)]}".indexOf(cleaned.charAt(cleaned.length() - 1)) >= 0) {
-            cleaned = cleaned.substring(0, cleaned.length() - 1);
-        }
-        return cleaned;
-    }
-
-    private static String read(java.io.InputStream inputStream) {
-        try (inputStream) {
-            return new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            return "[failed to read stream: " + e.getMessage() + "]";
-        }
+    public ToolResult executeBackground(ToolRequest request) {
+        return runner.run(request.arguments(), DEFAULT_BACKGROUND_TIMEOUT_SECONDS, MAX_BACKGROUND_TIMEOUT_SECONDS);
     }
 }

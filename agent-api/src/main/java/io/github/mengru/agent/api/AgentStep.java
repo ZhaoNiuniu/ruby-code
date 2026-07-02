@@ -4,15 +4,24 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
-public record AgentStep(Type type, String content, String toolCallId, String toolName, JsonNode toolArguments) {
+public record AgentStep(
+        Type type,
+        String content,
+        String toolCallId,
+        String toolName,
+        JsonNode toolArguments,
+        Map<String, String> metadata
+) {
 
     public enum Type {
         THOUGHT,
         TOOL_CALL,
         TOOL_RESULT,
+        TASK_NOTIFICATION,
         FINAL_ANSWER,
         ERROR
     }
@@ -23,6 +32,11 @@ public record AgentStep(Type type, String content, String toolCallId, String too
         if (toolArguments == null) {
             toolArguments = JsonNodeFactory.instance.objectNode();
         }
+        metadata = metadata == null ? Map.of() : Map.copyOf(metadata);
+    }
+
+    public AgentStep(Type type, String content, String toolCallId, String toolName, JsonNode toolArguments) {
+        this(type, content, toolCallId, toolName, toolArguments, Map.of());
     }
 
     public static AgentStep thought(String content) {
@@ -37,8 +51,12 @@ public record AgentStep(Type type, String content, String toolCallId, String too
     }
 
     public static AgentStep toolCall(String toolCallId, String toolName, JsonNode toolArguments) {
+        return toolCall(toolCallId, toolName, toolArguments, Map.of());
+    }
+
+    public static AgentStep toolCall(String toolCallId, String toolName, JsonNode toolArguments, Map<String, String> metadata) {
         Objects.requireNonNull(toolName, "toolName must not be null");
-        return new AgentStep(Type.TOOL_CALL, "Call tool: " + toolName, toolCallId, toolName, toolArguments);
+        return new AgentStep(Type.TOOL_CALL, "Call tool: " + toolName, toolCallId, toolName, toolArguments, metadata);
     }
 
     public static AgentStep toolResult(String toolName, String output) {
@@ -50,8 +68,17 @@ public record AgentStep(Type type, String content, String toolCallId, String too
         return new AgentStep(Type.TOOL_RESULT, output, toolCallId, toolName, null);
     }
 
+    public static AgentStep taskNotification(BackgroundTaskNotification notification) {
+        Objects.requireNonNull(notification, "notification must not be null");
+        return new AgentStep(Type.TASK_NOTIFICATION, notification.asMessage(), null, null, null);
+    }
+
     public static AgentStep finalAnswer(String content) {
         return new AgentStep(Type.FINAL_ANSWER, content, null, null, null);
+    }
+
+    public static AgentStep finalAnswer(String content, Map<String, String> metadata) {
+        return new AgentStep(Type.FINAL_ANSWER, content, null, null, null, metadata);
     }
 
     public static AgentStep error(String content) {
@@ -68,5 +95,9 @@ public record AgentStep(Type type, String content, String toolCallId, String too
 
     public JsonNode toolArgumentsOrEmptyObject() {
         return toolArguments == null ? JsonNodeFactory.instance.objectNode() : toolArguments;
+    }
+
+    public AgentStep withMetadata(Map<String, String> newMetadata) {
+        return new AgentStep(type, content, toolCallId, toolName, toolArguments, newMetadata);
     }
 }

@@ -27,6 +27,30 @@ class DefaultPermissionCheckerTest {
                 .isEqualTo(PermissionDecision.Outcome.ALLOW);
         assertThat(checker.check(request("load_skill", args().put("name", "java-agent"))).outcome())
                 .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("schedule_task", args().put("task", "ping").put("type", "once"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("list_scheduled_tasks", args())).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("cancel_scheduled_task", args().put("jobId", "job_1"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("create_task", args().put("subject", "s").put("description", "d"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("list_tasks", args())).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("get_task", args().put("taskId", "task_000001"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("can_start", args().put("taskId", "task_000001"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("claim_task", args().put("taskId", "task_000001"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("complete_task", args().put("taskId", "task_000001"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("spawn_teammate", args().put("role", "reader").put("task", "inspect"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("send_message", args().put("to", "lead").put("type", "plain_text").put("content", "hi"))).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
+        assertThat(checker.check(request("list_teammates", args())).outcome())
+                .isEqualTo(PermissionDecision.Outcome.ALLOW);
         assertThat(checker.check(request("read_file", args().put("path", "README.md"))).outcome())
                 .isEqualTo(PermissionDecision.Outcome.ALLOW);
         assertThat(checker.check(request("glob", args().put("pattern", "**/*.java"))).outcome())

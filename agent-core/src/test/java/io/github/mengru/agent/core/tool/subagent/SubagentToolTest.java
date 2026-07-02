@@ -136,8 +136,8 @@ class SubagentToolTest {
         ToolResult result = tool.execute(request(arguments));
 
         assertThat(result.success()).isTrue();
-        assertThat(toolNames.get()).containsExactly("todo_write", "read_file", "glob", "bash");
-        assertThat(toolNames.get()).doesNotContain("write_file", "edit_file", "subagent");
+        assertThat(toolNames.get()).containsExactly("todo_write", "list_tasks", "get_task", "can_start", "read_file", "glob", "bash");
+        assertThat(toolNames.get()).doesNotContain("create_task", "claim_task", "complete_task", "write_file", "edit_file", "subagent");
     }
 
     @Test
@@ -154,8 +154,8 @@ class SubagentToolTest {
         ToolResult result = tool.execute(request(arguments));
 
         assertThat(result.success()).isTrue();
-        assertThat(toolNames.get()).containsExactly("todo_write", "load_skill", "read_file", "glob", "bash");
-        assertThat(toolNames.get()).doesNotContain("write_file", "edit_file", "subagent");
+        assertThat(toolNames.get()).containsExactly("todo_write", "load_skill", "list_tasks", "get_task", "can_start", "read_file", "glob", "bash");
+        assertThat(toolNames.get()).doesNotContain("create_task", "claim_task", "complete_task", "write_file", "edit_file", "subagent");
     }
 
     @Test

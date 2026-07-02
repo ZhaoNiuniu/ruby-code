@@ -2,10 +2,14 @@ package io.github.mengru.agent.core.prompt;
 
 import io.github.mengru.agent.api.AgentMemory;
 import io.github.mengru.agent.api.AgentRequest;
+import io.github.mengru.agent.api.AgentStep;
 import io.github.mengru.agent.api.ConversationMessage;
 import io.github.mengru.agent.core.memory.MemoryCatalog;
+import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.skill.SkillCatalog;
 import io.github.mengru.agent.core.skill.SkillDefinition;
+import io.github.mengru.agent.core.task.TaskManager;
+import io.github.mengru.agent.core.team.TeamRuntime;
 import io.github.mengru.agent.core.tool.ToolRegistry;
 import io.github.mengru.agent.core.tool.todo.TodoWriteTool;
 import org.junit.jupiter.api.Test;
@@ -47,6 +51,9 @@ class PromptAssemblerTest {
         assertThat(assembled.systemPrompt()).contains(workspace.toAbsolutePath().normalize().toString());
         assertThat(assembled.systemPrompt()).contains("## tools");
         assertThat(assembled.systemPrompt()).contains("todo_write");
+        assertThat(assembled.systemPrompt()).contains("## task_system");
+        assertThat(assembled.systemPrompt()).contains("Durable project tasks live in .tasks/{id}.json");
+        assertThat(assembled.systemPrompt()).contains("claim_task records this runtime agent as owner");
         assertThat(assembled.systemPrompt()).contains("## skill_catalog");
         assertThat(assembled.systemPrompt()).contains("java-agent: Java agent guidance");
         assertThat(assembled.systemPrompt()).contains("## todo_planning");
@@ -75,6 +82,33 @@ class PromptAssemblerTest {
         assertThat(assembled.systemPrompt()).doesNotContain("Use tabs instead of spaces.");
         assertThat(assembled.task()).contains("## Relevant Long-Term Memory");
         assertThat(assembled.task()).contains("Use tabs instead of spaces.");
+    }
+
+    @Test
+    void modelIdentitySectionUsesRuntimeMetadata() {
+        AgentRequest request = new AgentRequest(
+                "what model are you",
+                8,
+                Map.of(
+                        PromptAssembler.PROVIDER_METADATA_KEY, "openai-compatible",
+                        PromptAssembler.MODEL_METADATA_KEY, "deepseek-chat",
+                        PromptAssembler.BASE_URL_METADATA_KEY, "https://api.deepseek.com/v1"
+                )
+        );
+
+        AgentRequest assembled = assemble(
+                PromptMode.MAIN,
+                ToolRegistry.defaultTools(),
+                MemoryCatalog.empty(workspace),
+                SkillCatalog.empty(),
+                request
+        );
+
+        assertThat(assembled.systemPrompt()).contains("## model_identity");
+        assertThat(assembled.systemPrompt()).contains("provider: openai-compatible");
+        assertThat(assembled.systemPrompt()).contains("model: deepseek-chat");
+        assertThat(assembled.systemPrompt()).contains("base_url: https://api.deepseek.com/v1");
+        assertThat(assembled.systemPrompt()).contains("Do not claim to be Claude");
     }
 
     @Test
@@ -153,8 +187,62 @@ class PromptAssemblerTest {
         assertThat(assembled.systemPrompt()).contains("## subagent_expected_output");
         assertThat(assembled.systemPrompt()).contains("Include files touched.");
         assertThat(assembled.systemPrompt()).contains("read_file");
+        assertThat(assembled.systemPrompt()).contains("## task_system");
+        assertThat(assembled.systemPrompt()).contains("read-only task tools");
         assertThat(assembled.systemPrompt()).doesNotContain("write_file");
+        assertThat(assembled.systemPrompt()).doesNotContain("create_task:");
+        assertThat(assembled.systemPrompt()).doesNotContain("claim_task:");
+        assertThat(assembled.systemPrompt()).doesNotContain("complete_task:");
         assertThat(assembled.systemPrompt()).doesNotContain("Parent agent system prompt");
+    }
+
+    @Test
+    void leadPromptIncludesTeamGuidanceWhenTeamToolsAreEnabled() {
+        try (TeamRuntime teamRuntime = teamRuntime()) {
+            ToolRegistry tools = ToolRegistry.defaultToolsWithSubagent(
+                    (request, previousSteps, enabledTools) -> AgentStep.finalAnswer("ok"),
+                    UserApprover.denyAll(),
+                    SkillCatalog.empty(),
+                    MemoryCatalog.empty(workspace),
+                    null,
+                    new TaskManager(workspace),
+                    teamRuntime
+            );
+
+            AgentRequest assembled = assemble(
+                    PromptMode.MAIN,
+                    tools,
+                    MemoryCatalog.empty(workspace),
+                    SkillCatalog.empty(),
+                    AgentRequest.of("coordinate work")
+            );
+
+            assertThat(assembled.systemPrompt()).contains("## team_system");
+            assertThat(assembled.systemPrompt()).contains("spawn_teammate");
+            assertThat(assembled.systemPrompt()).contains("At most four teammates");
+        }
+    }
+
+    @Test
+    void teammatePromptUsesTeammateIdentityAndSendMessageGuidance() {
+        try (TeamRuntime teamRuntime = teamRuntime()) {
+            ToolRegistry tools = ToolRegistry.teammateTools(teamRuntime, new TaskManager(workspace));
+
+            AgentRequest assembled = assemble(
+                    PromptMode.TEAMMATE,
+                    tools,
+                    MemoryCatalog.empty(workspace),
+                    SkillCatalog.empty(),
+                    AgentRequest.of("handle assigned message")
+            );
+
+            assertThat(assembled.systemPrompt()).contains("persistent teammate agent");
+            assertThat(assembled.systemPrompt()).contains("## team_system");
+            assertThat(assembled.systemPrompt()).contains("to=lead");
+            assertThat(assembled.systemPrompt()).contains("send_message");
+            assertThat(assembled.systemPrompt()).doesNotContain("spawn_teammate:");
+            assertThat(assembled.systemPrompt()).doesNotContain("subagent:");
+        }
     }
 
     private AgentRequest assemble(
@@ -210,5 +298,20 @@ class PromptAssemblerTest {
                 
                 %s
                 """.formatted(name, description, type, body), StandardCharsets.UTF_8);
+    }
+
+    private TeamRuntime teamRuntime() {
+        return new TeamRuntime(
+                workspace,
+                "main",
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("ok"),
+                UserApprover.denyAll(),
+                SkillCatalog.empty(),
+                MemoryCatalog.empty(workspace),
+                new TaskManager(workspace),
+                io.github.mengru.agent.api.ModelOptions.defaults(),
+                "",
+                Map.of(TaskManager.AGENT_NAME_METADATA_KEY, "main")
+        );
     }
 }

@@ -6,7 +6,10 @@ import io.github.mengru.agent.api.AgentMemory;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.AgentStep;
+import io.github.mengru.agent.api.BackgroundTaskNotification;
 import io.github.mengru.agent.api.ConversationMessage;
+import io.github.mengru.agent.api.ModelErrorCode;
+import io.github.mengru.agent.api.ModelException;
 import io.github.mengru.agent.core.DefaultAgent;
 import io.github.mengru.agent.core.EchoTool;
 import io.github.mengru.agent.api.PromptTooLongException;
@@ -61,6 +64,7 @@ class OpenAiCompatibleModelClientTest {
         assertThat(step.content()).isEqualTo("hello from model");
         JsonNode request = requests.get(0);
         assertThat(request.get("model").asText()).isEqualTo("test-model");
+        assertThat(request.get("max_tokens").asInt()).isEqualTo(8192);
         assertThat(request.get("tool_choice").asText()).isEqualTo("auto");
         assertThat(request.get("parallel_tool_calls").asBoolean()).isFalse();
         assertThat(request.at("/tools/0/function/name").asText()).isEqualTo("echo");
@@ -70,7 +74,7 @@ class OpenAiCompatibleModelClientTest {
     @Test
     void drivesToolCallLoopThenFinalAnswer() {
         responses.add(new FakeResponse(200, """
-                {"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"echo","arguments":"{\\"input\\":\\"hello tool\\"}"}}]}}]}
+                {"choices":[{"message":{"role":"assistant","content":null,"reasoning_content":"need echo","tool_calls":[{"id":"call_1","type":"function","function":{"name":"echo","arguments":"{\\"input\\":\\"hello tool\\"}"}}]}}]}
                 """));
         responses.add(new FakeResponse(200, """
                 {"choices":[{"message":{"role":"assistant","content":"done"}}]}
@@ -86,9 +90,23 @@ class OpenAiCompatibleModelClientTest {
                 .containsExactly(AgentStep.Type.TOOL_CALL, AgentStep.Type.TOOL_RESULT, AgentStep.Type.FINAL_ANSWER);
         assertThat(requests).hasSize(2);
         assertThat(requests.get(1).at("/messages/2/tool_calls/0/id").asText()).isEqualTo("call_1");
+        assertThat(requests.get(1).at("/messages/2/reasoning_content").asText()).isEqualTo("need echo");
         assertThat(requests.get(1).at("/messages/3/role").asText()).isEqualTo("tool");
         assertThat(requests.get(1).at("/messages/3/tool_call_id").asText()).isEqualTo("call_1");
         assertThat(requests.get(1).at("/messages/3/content").asText()).isEqualTo("echo: hello tool");
+    }
+
+    @Test
+    void parsesReasoningContentIntoStepMetadata() {
+        responses.add(new FakeResponse(200, """
+                {"choices":[{"message":{"role":"assistant","content":"done","reasoning_content":"internal trace"}}]}
+                """));
+
+        AgentStep step = client().nextStep(AgentRequest.of("hello"), List.of(), List.of());
+
+        assertThat(step.type()).isEqualTo(AgentStep.Type.FINAL_ANSWER);
+        assertThat(step.metadata())
+                .containsEntry(OpenAiCompatibleModelClient.REASONING_CONTENT_METADATA_KEY, "internal trace");
     }
 
     @Test
@@ -159,6 +177,28 @@ class OpenAiCompatibleModelClientTest {
     }
 
     @Test
+    void rendersTaskNotificationAsIndependentUserMessage() {
+        responses.add(new FakeResponse(200, """
+                {"choices":[{"message":{"role":"assistant","content":"done"}}]}
+                """));
+
+        client().nextStep(
+                AgentRequest.of("continue"),
+                List.of(AgentStep.taskNotification(
+                        new BackgroundTaskNotification("bg_1", "bash", "completed", "done")
+                )),
+                List.of()
+        );
+
+        JsonNode messages = requests.get(0).get("messages");
+        assertThat(messages.get(0).get("role").asText()).isEqualTo("user");
+        assertThat(messages.get(0).get("content").asText()).isEqualTo("continue");
+        assertThat(messages.get(1).get("role").asText()).isEqualTo("user");
+        assertThat(messages.get(1).get("content").asText()).contains("<task_notification");
+        assertThat(messages.get(1).has("tool_call_id")).isFalse();
+    }
+
+    @Test
     void requiresApiKeyFromEnvironment() {
         assertThatThrownBy(() -> OpenAiCompatibleModelClient.fromEnvironment("model", Map.of()))
                 .isInstanceOf(OpenAiCompatibleException.class)
@@ -215,7 +255,38 @@ class OpenAiCompatibleModelClientTest {
 
         assertThatThrownBy(() -> client().nextStep(AgentRequest.of("hello"), List.of(), List.of()))
                 .isInstanceOf(PromptTooLongException.class)
-                .hasMessageContaining("prompt is too long");
+                .hasMessageContaining("prompt is too long")
+                .satisfies(exception -> assertThat(((ModelException) exception).code())
+                        .isEqualTo(ModelErrorCode.PROMPT_TOO_LONG));
+    }
+
+    @Test
+    void mapsFinishReasonLengthToOutputTruncated() {
+        responses.add(new FakeResponse(200, """
+                {"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"partial"}}]}
+                """));
+
+        assertThatThrownBy(() -> client().nextStep(AgentRequest.of("hello"), List.of(), List.of()))
+                .isInstanceOf(ModelException.class)
+                .satisfies(exception -> {
+                    ModelException modelException = (ModelException) exception;
+                    assertThat(modelException.code()).isEqualTo(ModelErrorCode.OUTPUT_TRUNCATED);
+                    assertThat(modelException.partialContent()).isEqualTo("partial");
+                });
+    }
+
+    @Test
+    void mapsTransientHttpStatusWithRetryAfter() {
+        responses.add(new FakeResponse(429, "{\"error\":{\"message\":\"rate limited\"}}", Map.of("Retry-After", List.of("2"))));
+
+        assertThatThrownBy(() -> client().nextStep(AgentRequest.of("hello"), List.of(), List.of()))
+                .isInstanceOf(ModelException.class)
+                .satisfies(exception -> {
+                    ModelException modelException = (ModelException) exception;
+                    assertThat(modelException.code()).isEqualTo(ModelErrorCode.TRANSIENT);
+                    assertThat(modelException.statusCode()).isEqualTo(429);
+                    assertThat(modelException.retryAfter()).contains(Duration.ofSeconds(2));
+                });
     }
 
     @Test
@@ -223,8 +294,23 @@ class OpenAiCompatibleModelClientTest {
         responses.add(new FakeResponse(200, "{ nope"));
 
         assertThatThrownBy(() -> client().nextStep(AgentRequest.of("hello"), List.of(), List.of()))
-                .isInstanceOf(OpenAiCompatibleException.class)
-                .hasMessageContaining("response JSON");
+                .isInstanceOf(ModelException.class)
+                .hasMessageContaining("response JSON")
+                .satisfies(exception -> assertThat(((ModelException) exception).code())
+                        .isEqualTo(ModelErrorCode.NON_RETRYABLE));
+    }
+
+    @Test
+    void mapsInvalidToolArgumentsToNonRetryable() {
+        responses.add(new FakeResponse(200, """
+                {"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"echo","arguments":"{"}}]}}]}
+                """));
+
+        assertThatThrownBy(() -> client().nextStep(AgentRequest.of("hello"), List.of(), List.of()))
+                .isInstanceOf(ModelException.class)
+                .hasMessageContaining("tool call arguments")
+                .satisfies(exception -> assertThat(((ModelException) exception).code())
+                        .isEqualTo(ModelErrorCode.NON_RETRYABLE));
     }
 
     private OpenAiCompatibleModelClient client() {
@@ -249,7 +335,7 @@ class OpenAiCompatibleModelClientTest {
             }
             FakeResponse response = responses.remove();
             @SuppressWarnings("unchecked")
-            HttpResponse<T> cast = (HttpResponse<T>) new FakeHttpResponse(request, response.statusCode(), response.body());
+            HttpResponse<T> cast = (HttpResponse<T>) new FakeHttpResponse(request, response.statusCode(), response.body(), response.headers());
             return cast;
         }
 
@@ -319,7 +405,12 @@ class OpenAiCompatibleModelClientTest {
         }
     }
 
-    private record FakeHttpResponse(HttpRequest request, int statusCode, String body) implements HttpResponse<String> {
+    private record FakeHttpResponse(
+            HttpRequest request,
+            int statusCode,
+            String body,
+            Map<String, List<String>> headerMap
+    ) implements HttpResponse<String> {
 
         @Override
         public Optional<HttpResponse<String>> previousResponse() {
@@ -328,7 +419,7 @@ class OpenAiCompatibleModelClientTest {
 
         @Override
         public HttpHeaders headers() {
-            return HttpHeaders.of(Map.of(), (name, value) -> true);
+            return HttpHeaders.of(headerMap, (name, value) -> true);
         }
 
         @Override
@@ -383,6 +474,10 @@ class OpenAiCompatibleModelClientTest {
         }
     }
 
-    private record FakeResponse(int statusCode, String body) {
+    private record FakeResponse(int statusCode, String body, Map<String, List<String>> headers) {
+
+        private FakeResponse(int statusCode, String body) {
+            this(statusCode, body, Map.of());
+        }
     }
 }

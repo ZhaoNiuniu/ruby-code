@@ -32,6 +32,9 @@ public final class DefaultPermissionChecker implements PermissionChecker {
             case "subagent" -> PermissionDecision.allow();
             case "todo_write" -> PermissionDecision.allow();
             case "load_skill" -> PermissionDecision.allow();
+            case "schedule_task", "list_scheduled_tasks", "cancel_scheduled_task" -> PermissionDecision.allow();
+            case "create_task", "list_tasks", "get_task", "can_start", "claim_task", "complete_task" -> PermissionDecision.allow();
+            case "spawn_teammate", "send_message", "list_teammates" -> PermissionDecision.allow();
             case "read_file" -> checkPathTool(request, false);
             case "write_file", "edit_file" -> checkPathTool(request, true);
             case "glob" -> checkGlob(request);

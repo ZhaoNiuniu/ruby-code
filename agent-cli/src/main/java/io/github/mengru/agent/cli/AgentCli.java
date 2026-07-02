@@ -3,7 +3,9 @@ package io.github.mengru.agent.cli;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.ModelClient;
+import io.github.mengru.agent.api.ModelOptions;
 import io.github.mengru.agent.core.AgentSession;
+import io.github.mengru.agent.core.background.BackgroundTaskManager;
 import io.github.mengru.agent.core.DefaultAgent;
 import io.github.mengru.agent.core.EchoModelClient;
 import io.github.mengru.agent.core.context.ContextCompressionConfig;
@@ -15,8 +17,24 @@ import io.github.mengru.agent.core.memory.MemoryExtractor;
 import io.github.mengru.agent.core.memory.MemoryStore;
 import io.github.mengru.agent.core.permission.PermissionRequest;
 import io.github.mengru.agent.core.permission.UserApprover;
+import io.github.mengru.agent.core.prompt.PromptAssembler;
+import io.github.mengru.agent.core.recovery.ErrorRecoveryConfig;
+import io.github.mengru.agent.core.scheduler.CronExecutionResult;
+import io.github.mengru.agent.core.scheduler.CronQueue;
+import io.github.mengru.agent.core.scheduler.CronQueueProcessor;
+import io.github.mengru.agent.core.scheduler.CronScheduler;
+import io.github.mengru.agent.core.scheduler.CronTriggeredTask;
+import io.github.mengru.agent.core.scheduler.ScheduledJobStore;
+import io.github.mengru.agent.core.scheduler.ScheduledTaskManager;
 import io.github.mengru.agent.core.skill.SkillCatalog;
+import io.github.mengru.agent.core.task.TaskManager;
+import io.github.mengru.agent.core.team.TeamExecutionResult;
+import io.github.mengru.agent.core.team.TeamInboxPoller;
+import io.github.mengru.agent.core.team.TeamMessage;
+import io.github.mengru.agent.core.team.TeamRuntime;
 import io.github.mengru.agent.core.tool.ToolRegistry;
+import io.github.mengru.agent.core.trace.TraceFormatter;
+import io.github.mengru.agent.core.trace.TraceSink;
 import io.github.mengru.agent.provider.openai.OpenAiCompatibleException;
 import io.github.mengru.agent.provider.openai.OpenAiCompatibleModelClient;
 import picocli.CommandLine;
@@ -34,6 +52,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -109,6 +128,54 @@ public final class AgentCli implements Callable<Integer> {
         return memoryCatalog;
     }
 
+    private static Map<String, String> modelIdentityMetadata(
+            String provider,
+            String cliModel,
+            Map<String, String> environment,
+            boolean fixedModelClient
+    ) {
+        LinkedHashMap<String, String> metadata = new LinkedHashMap<>();
+        if (fixedModelClient) {
+            metadata.put(PromptAssembler.PROVIDER_METADATA_KEY, "fixed-test-client");
+            metadata.put(PromptAssembler.MODEL_METADATA_KEY, "fixed-test-client");
+            return metadata;
+        }
+
+        String resolvedProvider = provider == null || provider.isBlank() ? "echo" : provider.strip();
+        metadata.put(PromptAssembler.PROVIDER_METADATA_KEY, resolvedProvider);
+        if ("openai-compatible".equals(resolvedProvider)) {
+            String resolvedModel = firstNonBlank(cliModel, environment.get("OPENAI_MODEL"));
+            String resolvedBaseUrl = firstNonBlank(environment.get("OPENAI_BASE_URL"), OpenAiCompatibleModelClient.DEFAULT_BASE_URL);
+            if (resolvedModel != null) {
+                metadata.put(PromptAssembler.MODEL_METADATA_KEY, resolvedModel);
+            }
+            metadata.put(PromptAssembler.BASE_URL_METADATA_KEY, resolvedBaseUrl);
+        } else if ("echo".equals(resolvedProvider)) {
+            metadata.put(PromptAssembler.MODEL_METADATA_KEY, "echo");
+        }
+        return Map.copyOf(metadata);
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value.strip();
+            }
+        }
+        return null;
+    }
+
+    private static TraceSink stderrTraceSink(CommandSpec spec) {
+        return event -> {
+            spec.commandLine().getErr().println(TraceFormatter.format(event));
+            spec.commandLine().getErr().flush();
+        };
+    }
+
+    private static boolean isCronTriggered(PermissionRequest request) {
+        return "cron".equals(request.metadata().get("agent.trigger"));
+    }
+
     @Command(name = "run", description = "Runs a task through the default echo agent.")
     static final class RunCommand implements Callable<Integer> {
 
@@ -154,17 +221,35 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--system", description = "System prompt for the agent.")
         private String systemPrompt;
 
+        @Option(names = "--agent-name", defaultValue = "main", description = "Runtime agent name used for task ownership.")
+        private String agentName;
+
         @Option(names = "--no-context-compression", description = "Disable context compression for this run.")
         private boolean noContextCompression;
 
         @Option(names = "--context-window-tokens", defaultValue = "128000", description = "Estimated context window tokens.")
         private int contextWindowTokens;
 
-        @Option(names = "--max-output-tokens", defaultValue = "4000", description = "Estimated maximum output tokens.")
+        @Option(names = "--max-output-tokens", defaultValue = "4000", description = "Estimated output budget reserved for context compression.")
         private int maxOutputTokens;
 
         @Option(names = "--reserved-tokens", defaultValue = "13000", description = "Estimated reserved tokens for safety margin.")
         private int reservedTokens;
+
+        @Option(names = "--no-error-recovery", description = "Disable model-call error recovery.")
+        private boolean noErrorRecovery;
+
+        @Option(names = "--model-retry-attempts", defaultValue = "3", description = "Transient model error retry attempts.")
+        private int modelRetryAttempts;
+
+        @Option(names = "--generation-max-output-tokens", defaultValue = "8192", description = "Generation max output tokens sent to the provider.")
+        private int generationMaxOutputTokens;
+
+        @Option(names = "--recovery-max-output-tokens", defaultValue = "65536", description = "Max output tokens used for output-truncation recovery.")
+        private int recoveryMaxOutputTokens;
+
+        @Option(names = "--trace", description = "Print safe runtime trace events to stderr.")
+        private boolean trace;
 
         @Parameters(arity = "0..*", paramLabel = "TASK", description = "Task for the agent to run.")
         private List<String> taskParts;
@@ -178,8 +263,11 @@ public final class AgentCli implements Callable<Integer> {
             }
 
             DefaultAgent agent;
+            ModelOptions modelOptions;
             try {
+                modelOptions = createModelOptions();
                 ModelClient modelClient = createModelClient();
+                BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.disabled();
                 UserApprover userApprover = createUserApprover();
                 SkillCatalog skillCatalog = SkillCatalog.scanDefault();
                 MemoryStore memoryStore = MemoryStore.defaultStore();
@@ -190,14 +278,18 @@ public final class AgentCli implements Callable<Integer> {
                         modelClient,
                         toolRegistry,
                         createHookRegistry(toolRegistry, userApprover, modelClient, memoryStore, memoryCatalog),
-                        createContextManager()
+                        createContextManager(),
+                        createErrorRecoveryConfig(),
+                        backgroundTaskManager,
+                        trace ? stderrTraceSink(spec) : TraceSink.noop()
                 );
             } catch (IllegalArgumentException | OpenAiCompatibleException e) {
                 spec.commandLine().getErr().println(e.getMessage());
                 return CommandLine.ExitCode.USAGE;
             }
 
-            AgentRequest request = new AgentRequest(task, maxSteps, Map.of(), systemPrompt);
+            AgentRequest request = new AgentRequest(task, maxSteps, requestMetadata(), systemPrompt)
+                    .withModelOptions(modelOptions);
             AgentResult result;
             try {
                 result = agent.run(request);
@@ -212,6 +304,9 @@ public final class AgentCli implements Callable<Integer> {
 
         private UserApprover createUserApprover() {
             return (request, decision) -> {
+                if (isCronTriggered(request)) {
+                    return false;
+                }
                 if (!interactiveApproval) {
                     return false;
                 }
@@ -274,6 +369,33 @@ public final class AgentCli implements Callable<Integer> {
                     ContextCompressionConfig.DEFAULT_REACTIVE_RECENT_LOGICAL_ITEMS,
                     ContextCompressionConfig.DEFAULT_MAX_AUTO_COMPACT_FAILURES
             ));
+        }
+
+        private ErrorRecoveryConfig createErrorRecoveryConfig() {
+            if (noErrorRecovery) {
+                return ErrorRecoveryConfig.disabled();
+            }
+            return new ErrorRecoveryConfig(
+                    true,
+                    modelRetryAttempts,
+                    recoveryMaxOutputTokens,
+                    ErrorRecoveryConfig.DEFAULT_BASE_DELAY,
+                    true
+            );
+        }
+
+        private ModelOptions createModelOptions() {
+            return new ModelOptions(generationMaxOutputTokens);
+        }
+
+        private Map<String, String> requestMetadata() {
+            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(modelIdentityMetadata(provider, model, environment, fixedModelClient != null));
+            metadata.put(TaskManager.AGENT_NAME_METADATA_KEY, resolvedAgentName());
+            return Map.copyOf(metadata);
+        }
+
+        private String resolvedAgentName() {
+            return agentName == null || agentName.isBlank() ? "main" : agentName.strip();
         }
 
         private HookRegistry createHookRegistry(
@@ -377,79 +499,226 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--system", description = "System prompt for the agent.")
         private String systemPrompt;
 
+        @Option(names = "--agent-name", defaultValue = "main", description = "Runtime agent name used for task ownership.")
+        private String agentName;
+
         @Option(names = "--no-context-compression", description = "Disable context compression for this chat session.")
         private boolean noContextCompression;
 
         @Option(names = "--context-window-tokens", defaultValue = "128000", description = "Estimated context window tokens.")
         private int contextWindowTokens;
 
-        @Option(names = "--max-output-tokens", defaultValue = "4000", description = "Estimated maximum output tokens.")
+        @Option(names = "--max-output-tokens", defaultValue = "4000", description = "Estimated output budget reserved for context compression.")
         private int maxOutputTokens;
 
         @Option(names = "--reserved-tokens", defaultValue = "13000", description = "Estimated reserved tokens for safety margin.")
         private int reservedTokens;
 
+        @Option(names = "--no-error-recovery", description = "Disable model-call error recovery.")
+        private boolean noErrorRecovery;
+
+        @Option(names = "--model-retry-attempts", defaultValue = "3", description = "Transient model error retry attempts.")
+        private int modelRetryAttempts;
+
+        @Option(names = "--generation-max-output-tokens", defaultValue = "8192", description = "Generation max output tokens sent to the provider.")
+        private int generationMaxOutputTokens;
+
+        @Option(names = "--recovery-max-output-tokens", defaultValue = "65536", description = "Max output tokens used for output-truncation recovery.")
+        private int recoveryMaxOutputTokens;
+
+        @Option(names = "--no-trace", description = "Disable safe runtime trace events in chat.")
+        private boolean noTrace;
+
         @Override
         public Integer call() throws IOException {
             AgentSession session;
+            ModelOptions modelOptions;
+            CronScheduler cronScheduler;
+            CronQueueProcessor cronQueueProcessor;
+            TeamRuntime teamRuntime;
+            TeamInboxPoller teamInboxPoller;
             try {
+                modelOptions = createModelOptions();
                 ModelClient modelClient = createModelClient();
+                BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.defaults();
+                CronQueue cronQueue = new CronQueue();
+                ScheduledTaskManager scheduledTaskManager = new ScheduledTaskManager(ScheduledJobStore.defaultStore(), cronQueue);
+                TaskManager taskManager = TaskManager.defaultManager();
                 UserApprover userApprover = createUserApprover();
                 SkillCatalog skillCatalog = SkillCatalog.scanDefault();
                 MemoryStore memoryStore = MemoryStore.defaultStore();
                 MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
                 printMemoryWarnings(memoryCatalog);
-                ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, memoryCatalog);
+                printScheduledTaskWarnings(scheduledTaskManager);
+                teamRuntime = new TeamRuntime(
+                        Path.of(""),
+                        resolvedAgentName(),
+                        modelClient,
+                        userApprover,
+                        skillCatalog,
+                        memoryCatalog,
+                        taskManager,
+                        modelOptions,
+                        systemPrompt,
+                        requestMetadata()
+                );
+                ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(
+                        modelClient,
+                        userApprover,
+                        skillCatalog,
+                        memoryCatalog,
+                        scheduledTaskManager,
+                        taskManager,
+                        teamRuntime
+                );
                 session = new AgentSession(new DefaultAgent(
                         modelClient,
                         toolRegistry,
                         createHookRegistry(toolRegistry, userApprover, modelClient, memoryStore, memoryCatalog),
-                        createContextManager()
-                ));
+                        createContextManager(),
+                        createErrorRecoveryConfig(),
+                        backgroundTaskManager,
+                        noTrace ? TraceSink.noop() : stderrTraceSink(spec)
+                ), backgroundTaskManager);
+                teamInboxPoller = new TeamInboxPoller(
+                        teamRuntime,
+                        session,
+                        this::requestMetadata,
+                        systemPrompt,
+                        maxSteps,
+                        modelOptions,
+                        this::printTeamResult
+                );
+                cronScheduler = new CronScheduler(scheduledTaskManager, cronQueue);
+                cronQueueProcessor = new CronQueueProcessor(
+                        cronQueue,
+                        session,
+                        task -> createCronRequest(task, modelOptions),
+                        this::printCronResult
+                );
             } catch (IllegalArgumentException | OpenAiCompatibleException e) {
                 spec.commandLine().getErr().println(e.getMessage());
                 return CommandLine.ExitCode.USAGE;
             }
 
+            cronScheduler.start();
+            cronQueueProcessor.start();
+            teamInboxPoller.start();
             int lastExitCode = 0;
-            while (true) {
-                if (interactiveApproval) {
-                    spec.commandLine().getErr().print("chat> ");
-                    spec.commandLine().getErr().flush();
-                }
-                String line = inputReader.readLine();
-                if (line == null) {
-                    return lastExitCode;
-                }
-                String task = line.strip();
-                if (task.isBlank()) {
-                    continue;
-                }
-                if ("/exit".equals(task) || "/quit".equals(task)) {
-                    return 0;
-                }
-                if ("/clear".equals(task)) {
-                    session.clear();
-                    spec.commandLine().getOut().println("Session cleared.");
-                    lastExitCode = 0;
-                    continue;
-                }
+            try {
+                while (true) {
+                    if (interactiveApproval) {
+                        spec.commandLine().getErr().print("chat> ");
+                        spec.commandLine().getErr().flush();
+                    }
+                    String line = inputReader.readLine();
+                    if (line == null) {
+                        return lastExitCode;
+                    }
+                    String task = line.strip();
+                    if (task.isBlank()) {
+                        continue;
+                    }
+                    if ("/exit".equals(task) || "/quit".equals(task)) {
+                        return 0;
+                    }
+                    if ("/clear".equals(task)) {
+                        session.clear();
+                        spec.commandLine().getOut().println("Session cleared.");
+                        lastExitCode = 0;
+                        continue;
+                    }
 
-                AgentResult result;
-                try {
-                    result = session.run(new AgentRequest(task, maxSteps, Map.of(), systemPrompt));
-                } catch (OpenAiCompatibleException e) {
-                    spec.commandLine().getErr().println(e.getMessage());
-                    lastExitCode = CommandLine.ExitCode.SOFTWARE;
-                    continue;
+                    AgentResult result;
+                    try {
+                        result = session.run(new AgentRequest(task, maxSteps, requestMetadata(), systemPrompt)
+                                .withModelOptions(modelOptions));
+                    } catch (OpenAiCompatibleException e) {
+                        spec.commandLine().getErr().println(e.getMessage());
+                        lastExitCode = CommandLine.ExitCode.SOFTWARE;
+                        continue;
+                    }
+                    spec.commandLine().getOut().println(result.output());
+                    lastExitCode = result.completed() ? 0 : 2;
                 }
-                spec.commandLine().getOut().println(result.output());
-                lastExitCode = result.completed() ? 0 : 2;
+            } finally {
+                teamInboxPoller.close();
+                teamRuntime.close();
+                cronQueueProcessor.close();
+                cronScheduler.close();
+            }
+        }
+
+        private AgentRequest createCronRequest(CronTriggeredTask task, ModelOptions modelOptions) {
+            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(requestMetadata());
+            metadata.put("agent.trigger", "cron");
+            metadata.put("agent.cron.jobId", task.job().jobId());
+            metadata.put("agent.cron.name", task.job().name());
+            metadata.put("agent.cron.type", task.job().type().value());
+            return new AgentRequest(task.asAgentTask(), maxSteps, metadata, systemPrompt)
+                    .withModelOptions(modelOptions);
+        }
+
+        private void printCronResult(CronExecutionResult execution) {
+            String prefix = cronOutputPrefix(execution.task());
+            String output;
+            if (!execution.success()) {
+                output = "failed: " + execution.error();
+            } else if (execution.result() == null) {
+                output = "failed: no result";
+            } else {
+                output = execution.result().output();
+            }
+            java.io.PrintWriter writer = spec.commandLine().getOut();
+            synchronized (writer) {
+                writer.println(prefix + " " + output);
+                writer.flush();
+            }
+        }
+
+        private String cronOutputPrefix(CronTriggeredTask task) {
+            String name = task.job().name();
+            if (name == null || name.isBlank()) {
+                return "[cron " + task.job().jobId() + "]";
+            }
+            return "[cron " + task.job().jobId() + " " + name + "]";
+        }
+
+        private void printTeamResult(TeamExecutionResult execution) {
+            String prefix = teamOutputPrefix(execution.messages());
+            String output;
+            if (!execution.success()) {
+                output = "failed: " + execution.error();
+            } else if (execution.result() == null) {
+                output = "failed: no result";
+            } else {
+                output = execution.result().output();
+            }
+            java.io.PrintWriter writer = spec.commandLine().getOut();
+            synchronized (writer) {
+                writer.println(prefix + " " + output);
+                writer.flush();
+            }
+        }
+
+        private String teamOutputPrefix(List<TeamMessage> messages) {
+            if (messages == null || messages.isEmpty()) {
+                return "[team inbox]";
+            }
+            return "[team " + messages.get(0).from() + "]";
+        }
+
+        private void printScheduledTaskWarnings(ScheduledTaskManager scheduledTaskManager) {
+            for (String warning : scheduledTaskManager.warnings()) {
+                spec.commandLine().getErr().println("Scheduled task warning: " + warning);
             }
         }
 
         private UserApprover createUserApprover() {
             return (request, decision) -> {
+                if (isCronTriggered(request)) {
+                    return false;
+                }
                 if (!interactiveApproval) {
                     return false;
                 }
@@ -512,6 +781,33 @@ public final class AgentCli implements Callable<Integer> {
                     ContextCompressionConfig.DEFAULT_REACTIVE_RECENT_LOGICAL_ITEMS,
                     ContextCompressionConfig.DEFAULT_MAX_AUTO_COMPACT_FAILURES
             ));
+        }
+
+        private ErrorRecoveryConfig createErrorRecoveryConfig() {
+            if (noErrorRecovery) {
+                return ErrorRecoveryConfig.disabled();
+            }
+            return new ErrorRecoveryConfig(
+                    true,
+                    modelRetryAttempts,
+                    recoveryMaxOutputTokens,
+                    ErrorRecoveryConfig.DEFAULT_BASE_DELAY,
+                    true
+            );
+        }
+
+        private ModelOptions createModelOptions() {
+            return new ModelOptions(generationMaxOutputTokens);
+        }
+
+        private Map<String, String> requestMetadata() {
+            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(modelIdentityMetadata(provider, model, environment, fixedModelClient != null));
+            metadata.put(TaskManager.AGENT_NAME_METADATA_KEY, resolvedAgentName());
+            return Map.copyOf(metadata);
+        }
+
+        private String resolvedAgentName() {
+            return agentName == null || agentName.isBlank() ? "main" : agentName.strip();
         }
 
         private HookRegistry createHookRegistry(

@@ -6,7 +6,7 @@ import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentStep;
 import io.github.mengru.agent.api.ContextCompressionEvent;
 import io.github.mengru.agent.api.ModelClient;
-import io.github.mengru.agent.api.PromptTooLongException;
+import io.github.mengru.agent.api.ModelException;
 import io.github.mengru.agent.api.Tool;
 
 import java.time.Instant;
@@ -96,7 +96,7 @@ public final class ContextManager {
         return ContextView.ok(request, compacted, events);
     }
 
-    public ContextView reactiveCompact(AgentRequest request, List<AgentStep> originalSteps, PromptTooLongException cause) {
+    public ContextView reactiveCompact(AgentRequest request, List<AgentStep> originalSteps, ModelException cause) {
         Objects.requireNonNull(request, "request must not be null");
         Objects.requireNonNull(originalSteps, "originalSteps must not be null");
         int before = estimateTokens(request, originalSteps);

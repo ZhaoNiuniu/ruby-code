@@ -3,11 +3,16 @@ package io.github.mengru.agent.core;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.AgentStep;
+import io.github.mengru.agent.api.BackgroundTaskNotification;
 import io.github.mengru.agent.api.ContextCompressionEvent;
+import io.github.mengru.agent.api.ModelErrorCode;
+import io.github.mengru.agent.api.ModelException;
+import io.github.mengru.agent.api.ModelOptions;
 import io.github.mengru.agent.api.PromptTooLongException;
 import io.github.mengru.agent.api.Tool;
 import io.github.mengru.agent.api.ToolRequest;
 import io.github.mengru.agent.api.ToolResult;
+import io.github.mengru.agent.api.TraceEvent;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.mengru.agent.core.hook.HookEvent;
@@ -20,15 +25,21 @@ import io.github.mengru.agent.core.hook.UserPromptSubmitContext;
 import io.github.mengru.agent.core.permission.DefaultPermissionChecker;
 import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.context.ContextManager;
+import io.github.mengru.agent.core.background.BackgroundTaskManager;
+import io.github.mengru.agent.core.recovery.ErrorRecoveryConfig;
+import io.github.mengru.agent.core.recovery.ModelCallRecovery;
+import io.github.mengru.agent.core.recovery.RetrySleeper;
 import io.github.mengru.agent.core.skill.SkillCatalog;
 import io.github.mengru.agent.core.skill.SkillDefinition;
 import io.github.mengru.agent.core.tool.ToolRegistry;
+import io.github.mengru.agent.core.tool.local.BashTool;
 import io.github.mengru.agent.core.tool.subagent.SubagentTool;
 import io.github.mengru.agent.core.tool.todo.TodoWriteTool;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -99,6 +110,123 @@ class DefaultAgentTest {
         assertThat(result.compressionEvents())
                 .extracting(ContextCompressionEvent::stage)
                 .contains(ContextCompressionEvent.Stage.REACTIVE_COMPACT);
+        assertThat(result.recoveryEvents())
+                .anySatisfy(event -> {
+                    assertThat(event.errorCode()).isEqualTo(ModelErrorCode.PROMPT_TOO_LONG);
+                    assertThat(event.recovered()).isTrue();
+                });
+    }
+
+    @Test
+    void promptTooLongSecondFailureReturnsFailedResult() {
+        DefaultAgent agent = recoveringAgent((request, previousSteps, tools) -> {
+            throw new PromptTooLongException("still too long");
+        });
+
+        AgentResult result = agent.run(AgentRequest.of("large task"));
+
+        assertThat(result.completed()).isFalse();
+        assertThat(result.output()).contains("prompt too long after reactiveCompact");
+        assertThat(result.recoveryEvents())
+                .anySatisfy(event -> {
+                    assertThat(event.errorCode()).isEqualTo(ModelErrorCode.PROMPT_TOO_LONG);
+                    assertThat(event.recovered()).isFalse();
+                });
+    }
+
+    @Test
+    void outputTruncatedRaisesOutputBudgetAndContinues() {
+        AtomicInteger calls = new AtomicInteger();
+        AtomicReference<AgentRequest> retryRequest = new AtomicReference<>();
+        DefaultAgent agent = recoveringAgent((request, previousSteps, tools) -> {
+            if (calls.getAndIncrement() == 0) {
+                throw new ModelException(
+                        ModelErrorCode.OUTPUT_TRUNCATED,
+                        "length",
+                        null,
+                        -1,
+                        null,
+                        "part "
+                );
+            }
+            retryRequest.set(request);
+            return AgentStep.finalAnswer("two");
+        });
+
+        AgentResult result = agent.run(AgentRequest.of("write long answer")
+                .withModelOptions(new ModelOptions(8192)));
+
+        assertThat(result.completed()).isTrue();
+        assertThat(result.output()).isEqualTo("part two");
+        assertThat(calls.get()).isEqualTo(2);
+        assertThat(retryRequest.get().modelOptions().maxOutputTokens()).isEqualTo(65536);
+        assertThat(retryRequest.get().task()).contains("Continue from where it stopped");
+        assertThat(result.recoveryEvents())
+                .anySatisfy(event -> {
+                    assertThat(event.errorCode()).isEqualTo(ModelErrorCode.OUTPUT_TRUNCATED);
+                    assertThat(event.maxOutputTokensBefore()).isEqualTo(8192);
+                    assertThat(event.maxOutputTokensAfter()).isEqualTo(65536);
+                    assertThat(event.recovered()).isTrue();
+                });
+    }
+
+    @Test
+    void transientModelErrorRetriesWithoutConsumingAgentSteps() {
+        AtomicInteger calls = new AtomicInteger();
+        DefaultAgent agent = recoveringAgent((request, previousSteps, tools) -> {
+            if (calls.getAndIncrement() < 2) {
+                throw new ModelException(ModelErrorCode.TRANSIENT, "overloaded");
+            }
+            return AgentStep.finalAnswer("recovered");
+        });
+
+        AgentResult result = agent.run(new AgentRequest("retry", 1, java.util.Map.of()));
+
+        assertThat(result.completed()).isTrue();
+        assertThat(result.steps()).hasSize(1);
+        assertThat(calls.get()).isEqualTo(3);
+        assertThat(result.recoveryEvents())
+                .filteredOn(event -> event.errorCode() == ModelErrorCode.TRANSIENT)
+                .hasSize(2);
+    }
+
+    @Test
+    void transientModelErrorFailsAfterRetryBudget() {
+        AtomicInteger calls = new AtomicInteger();
+        DefaultAgent agent = recoveringAgent((request, previousSteps, tools) -> {
+            calls.incrementAndGet();
+            throw new ModelException(ModelErrorCode.TRANSIENT, "still overloaded");
+        });
+
+        AgentResult result = agent.run(AgentRequest.of("retry"));
+
+        assertThat(result.completed()).isFalse();
+        assertThat(result.output()).contains("transient model error after 3 retries");
+        assertThat(calls.get()).isEqualTo(4);
+        assertThat(result.recoveryEvents())
+                .filteredOn(event -> event.errorCode() == ModelErrorCode.TRANSIENT)
+                .hasSize(3);
+    }
+
+    @Test
+    void disabledErrorRecoveryDoesNotRetry() {
+        AtomicInteger calls = new AtomicInteger();
+        DefaultAgent agent = new DefaultAgent(
+                (request, previousSteps, tools) -> {
+                    calls.incrementAndGet();
+                    throw new ModelException(ModelErrorCode.TRANSIENT, "overloaded");
+                },
+                ToolRegistry.of(List.of()),
+                HookRegistry.empty(),
+                ContextManager.defaults(),
+                ModelCallRecovery.disabled()
+        );
+
+        AgentResult result = agent.run(AgentRequest.of("retry"));
+
+        assertThat(result.completed()).isFalse();
+        assertThat(calls.get()).isEqualTo(1);
+        assertThat(result.output()).contains("without recovery");
     }
 
     @Test
@@ -226,6 +354,62 @@ class DefaultAgentTest {
         assertThat(result.steps().get(1).toolCallId()).isEqualTo("call-permission");
         assertThat(result.steps().get(1).toolName()).isEqualTo("write_file");
         assertThat(result.output()).contains("permission denied");
+        assertThat(result.traceEvents())
+                .extracting(TraceEvent::type)
+                .contains(TraceEvent.Type.PERMISSION_DENIED);
+    }
+
+    @Test
+    void recordsAndEmitsSafeTraceEvents() {
+        List<TraceEvent> emitted = new ArrayList<>();
+        ObjectNode arguments = JsonNodeFactory.instance.objectNode();
+        arguments.put("api_key", "secret-value");
+        arguments.put("content", "sensitive body");
+        arguments.put("query", "visible query");
+        Tool traceTool = testTool("trace_tool", request -> ToolResult.success("x".repeat(600)));
+        DefaultAgent agent = new DefaultAgent(
+                (request, previousSteps, tools) -> {
+                    if (previousSteps.isEmpty()) {
+                        return AgentStep.toolCall("call-trace", "trace_tool", arguments);
+                    }
+                    return AgentStep.finalAnswer("done");
+                },
+                ToolRegistry.of(List.of(traceTool)),
+                HookRegistry.empty(),
+                ContextManager.defaults(),
+                ModelCallRecovery.defaults(),
+                BackgroundTaskManager.disabled(),
+                emitted::add
+        );
+
+        AgentResult result = agent.run(new AgentRequest("trace", 2, java.util.Map.of()));
+
+        assertThat(result.completed()).isTrue();
+        assertThat(emitted).containsExactlyElementsOf(result.traceEvents());
+        assertThat(result.traceEvents())
+                .extracting(TraceEvent::type)
+                .contains(
+                        TraceEvent.Type.MODEL_CALL,
+                        TraceEvent.Type.TOOL_CALL,
+                        TraceEvent.Type.TOOL_RESULT,
+                        TraceEvent.Type.FINAL_ANSWER
+                );
+        TraceEvent toolCall = result.traceEvents().stream()
+                .filter(event -> event.type() == TraceEvent.Type.TOOL_CALL)
+                .findFirst()
+                .orElseThrow();
+        assertThat(toolCall.attributes().get("args"))
+                .contains("api_key=[masked]")
+                .contains("content=[masked]")
+                .contains("query=visible query")
+                .doesNotContain("secret-value")
+                .doesNotContain("sensitive body");
+        TraceEvent toolResult = result.traceEvents().stream()
+                .filter(event -> event.type() == TraceEvent.Type.TOOL_RESULT)
+                .findFirst()
+                .orElseThrow();
+        assertThat(toolResult.attributes()).containsEntry("truncated", "true");
+        assertThat(toolResult.attributes().get("summary")).hasSize(500);
     }
 
     @Test
@@ -477,6 +661,92 @@ class DefaultAgentTest {
     }
 
     @Test
+    void startsExplicitBackgroundBashAndSkipsPostToolHookForPlaceholder() {
+        AtomicBoolean postHookCalled = new AtomicBoolean();
+        ObjectNode arguments = JsonNodeFactory.instance.objectNode();
+        arguments.put("command", "printf background");
+        arguments.put("run_in_background", true);
+        HookRegistry registry = HookRegistry.empty()
+                .registerHook(HookEvent.POST_TOOL_USE, (PostToolUseContext context) -> {
+                    postHookCalled.set(true);
+                    return HookResult.continueWith(context);
+                });
+        DefaultAgent agent = new DefaultAgent(
+                (request, previousSteps, tools) -> {
+                    if (previousSteps.isEmpty()) {
+                        return AgentStep.toolCall("call-bg", "bash", arguments);
+                    }
+                    return AgentStep.finalAnswer(previousSteps.get(previousSteps.size() - 1).content());
+                },
+                ToolRegistry.of(List.of(new BashTool(workspace))),
+                registry,
+                ContextManager.defaults(),
+                ModelCallRecovery.defaults(),
+                BackgroundTaskManager.defaults()
+        );
+
+        AgentResult result = agent.run(new AgentRequest("background", 2, java.util.Map.of()));
+
+        assertThat(result.completed()).isTrue();
+        assertThat(result.output()).contains("background task started");
+        assertThat(result.output()).contains("bg_id: bg_1");
+        assertThat(postHookCalled.get()).isFalse();
+        assertThat(result.steps())
+                .extracting(AgentStep::type)
+                .containsExactly(AgentStep.Type.TOOL_CALL, AgentStep.Type.TOOL_RESULT, AgentStep.Type.FINAL_ANSWER);
+    }
+
+    @Test
+    void permissionDenialPreventsBackgroundBashStart() {
+        ObjectNode arguments = JsonNodeFactory.instance.objectNode();
+        arguments.put("command", "printf denied");
+        arguments.put("run_in_background", true);
+        ToolRegistry tools = ToolRegistry.of(List.of(new BashTool(workspace)));
+        DefaultAgent agent = new DefaultAgent(
+                (request, previousSteps, toolDefinitions) -> {
+                    if (previousSteps.isEmpty()) {
+                        return AgentStep.toolCall("call-bg-denied", "bash", arguments);
+                    }
+                    return AgentStep.finalAnswer(previousSteps.get(previousSteps.size() - 1).content());
+                },
+                tools,
+                HookRegistry.defaultsFor(tools, UserApprover.denyAll()),
+                ContextManager.defaults(),
+                ModelCallRecovery.defaults(),
+                BackgroundTaskManager.defaults()
+        );
+
+        AgentResult result = agent.run(new AgentRequest("background denied", 2, java.util.Map.of()));
+
+        assertThat(result.completed()).isTrue();
+        assertThat(result.output()).contains("permission denied");
+        assertThat(result.output()).doesNotContain("bg_id");
+    }
+
+    @Test
+    void requestNotificationsBecomeInitialTaskNotificationSteps() {
+        AtomicReference<List<AgentStep>> seenSteps = new AtomicReference<>();
+        DefaultAgent agent = new DefaultAgent(
+                (request, previousSteps, tools) -> {
+                    seenSteps.set(previousSteps);
+                    return AgentStep.finalAnswer("ok");
+                },
+                ToolRegistry.of(List.of()),
+                HookRegistry.empty()
+        );
+
+        AgentResult result = agent.run(AgentRequest.of("notify").withNotifications(List.of(
+                new BackgroundTaskNotification("bg_1", "bash", "completed", "done")
+        )));
+
+        assertThat(result.completed()).isTrue();
+        assertThat(seenSteps.get())
+                .extracting(AgentStep::type)
+                .containsExactly(AgentStep.Type.TASK_NOTIFICATION);
+        assertThat(seenSteps.get().get(0).content()).contains("bg_1");
+    }
+
+    @Test
     void stopHookRunsBeforeAllReturnPaths() {
         List<String> reasons = new ArrayList<>();
         HookRegistry registry = HookRegistry.empty()
@@ -509,6 +779,25 @@ class DefaultAgentTest {
         AgentResult result = agent.run(AgentRequest.of("done"));
 
         assertThat(result.output()).isEqualTo("replaced final");
+    }
+
+    private static DefaultAgent recoveringAgent(io.github.mengru.agent.api.ModelClient modelClient) {
+        return new DefaultAgent(
+                modelClient,
+                ToolRegistry.of(List.of()),
+                HookRegistry.empty(),
+                ContextManager.defaults(),
+                new ModelCallRecovery(
+                        new ErrorRecoveryConfig(
+                                true,
+                                3,
+                                65536,
+                                Duration.ZERO,
+                                false
+                        ),
+                        RetrySleeper.noSleep()
+                )
+        );
     }
 
     private static Tool testTool(String name, java.util.function.Function<ToolRequest, ToolResult> executor) {

@@ -33,7 +33,6 @@ import io.github.mengru.agent.core.team.TeamInboxPoller;
 import io.github.mengru.agent.core.team.TeamMessage;
 import io.github.mengru.agent.core.team.TeamRuntime;
 import io.github.mengru.agent.core.tool.ToolRegistry;
-import io.github.mengru.agent.core.trace.TraceFormatter;
 import io.github.mengru.agent.core.trace.TraceSink;
 import io.github.mengru.agent.provider.openai.OpenAiCompatibleException;
 import io.github.mengru.agent.provider.openai.OpenAiCompatibleModelClient;
@@ -52,11 +51,17 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
 
 @Command(
         name = "agent",
@@ -165,10 +170,22 @@ public final class AgentCli implements Callable<Integer> {
         return null;
     }
 
-    private static TraceSink stderrTraceSink(CommandSpec spec) {
+    private static TraceSink stderrTraceSink(CommandSpec spec, TerminalStyle style) {
         return event -> {
-            spec.commandLine().getErr().println(TraceFormatter.format(event));
+            spec.commandLine().getErr().println(style.trace(event));
             spec.commandLine().getErr().flush();
+        };
+    }
+
+    private static TraceSink stderrTraceSink(CommandSpec spec, ChatConsole chatConsole, TerminalStyle style) {
+        return event -> {
+            chatConsole.beforeAsyncOutput();
+            try {
+                spec.commandLine().getErr().println(style.trace(event));
+                spec.commandLine().getErr().flush();
+            } finally {
+                chatConsole.afterAsyncOutput();
+            }
         };
     }
 
@@ -251,14 +268,24 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--trace", description = "Print safe runtime trace events to stderr.")
         private boolean trace;
 
+        @Option(names = "--color", defaultValue = "auto", description = "Color output: auto, always, never.")
+        private String color;
+
         @Parameters(arity = "0..*", paramLabel = "TASK", description = "Task for the agent to run.")
         private List<String> taskParts;
 
         @Override
         public Integer call() throws IOException {
+            TerminalStyle terminalStyle;
+            try {
+                terminalStyle = createTerminalStyle();
+            } catch (IllegalArgumentException e) {
+                spec.commandLine().getErr().println(e.getMessage());
+                return CommandLine.ExitCode.USAGE;
+            }
             String task = resolveTask();
             if (task.isBlank()) {
-                spec.commandLine().getErr().println("Missing task. Pass TASK arguments, type one at the prompt, or pipe one through stdin.");
+                spec.commandLine().getErr().println(terminalStyle.error("Missing task. Pass TASK arguments, type one at the prompt, or pipe one through stdin."));
                 return CommandLine.ExitCode.USAGE;
             }
 
@@ -268,11 +295,11 @@ public final class AgentCli implements Callable<Integer> {
                 modelOptions = createModelOptions();
                 ModelClient modelClient = createModelClient();
                 BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.disabled();
-                UserApprover userApprover = createUserApprover();
+                UserApprover userApprover = createUserApprover(terminalStyle);
                 SkillCatalog skillCatalog = SkillCatalog.scanDefault();
                 MemoryStore memoryStore = MemoryStore.defaultStore();
                 MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
-                printMemoryWarnings(memoryCatalog);
+                printMemoryWarnings(memoryCatalog, terminalStyle);
                 ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, memoryCatalog);
                 agent = new DefaultAgent(
                         modelClient,
@@ -281,10 +308,10 @@ public final class AgentCli implements Callable<Integer> {
                         createContextManager(),
                         createErrorRecoveryConfig(),
                         backgroundTaskManager,
-                        trace ? stderrTraceSink(spec) : TraceSink.noop()
+                        trace ? stderrTraceSink(spec, terminalStyle) : TraceSink.noop()
                 );
             } catch (IllegalArgumentException | OpenAiCompatibleException e) {
-                spec.commandLine().getErr().println(e.getMessage());
+                spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
                 return CommandLine.ExitCode.USAGE;
             }
 
@@ -294,7 +321,7 @@ public final class AgentCli implements Callable<Integer> {
             try {
                 result = agent.run(request);
             } catch (OpenAiCompatibleException e) {
-                spec.commandLine().getErr().println(e.getMessage());
+                spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
                 return CommandLine.ExitCode.SOFTWARE;
             }
 
@@ -302,7 +329,7 @@ public final class AgentCli implements Callable<Integer> {
             return result.completed() ? 0 : 2;
         }
 
-        private UserApprover createUserApprover() {
+        private UserApprover createUserApprover(TerminalStyle terminalStyle) {
             return (request, decision) -> {
                 if (isCronTriggered(request)) {
                     return false;
@@ -310,14 +337,14 @@ public final class AgentCli implements Callable<Integer> {
                 if (!interactiveApproval) {
                     return false;
                 }
-                spec.commandLine().getErr().println("Tool approval required:");
+                spec.commandLine().getErr().println(terminalStyle.warning("Tool approval required:"));
                 spec.commandLine().getErr().println("  tool: " + request.toolName());
                 spec.commandLine().getErr().println("  reason: " + decision.reason());
                 if (!decision.riskSummary().isBlank()) {
                     spec.commandLine().getErr().println("  risk: " + decision.riskSummary());
                 }
                 spec.commandLine().getErr().println("  arguments: " + summarizeArguments(request));
-                spec.commandLine().getErr().print("Allow this tool call? [y/N] ");
+                spec.commandLine().getErr().print(terminalStyle.warning("Allow this tool call? [y/N] "));
                 spec.commandLine().getErr().flush();
                 try {
                     String line = inputReader.readLine();
@@ -421,10 +448,14 @@ public final class AgentCli implements Callable<Integer> {
             return fixedModelClient == null && "openai-compatible".equals(provider);
         }
 
-        private void printMemoryWarnings(MemoryCatalog memoryCatalog) {
+        private void printMemoryWarnings(MemoryCatalog memoryCatalog, TerminalStyle terminalStyle) {
             for (String warning : memoryCatalog.warnings()) {
-                spec.commandLine().getErr().println("Memory warning: " + warning);
+                spec.commandLine().getErr().println(terminalStyle.warning("Memory warning: " + warning));
             }
+        }
+
+        private TerminalStyle createTerminalStyle() {
+            return TerminalStyle.of(color, interactiveApproval);
         }
 
         private String resolveModel() {
@@ -529,27 +560,38 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--no-trace", description = "Disable safe runtime trace events in chat.")
         private boolean noTrace;
 
+        @Option(names = "--color", defaultValue = "auto", description = "Color output: auto, always, never.")
+        private String color;
+
         @Override
         public Integer call() throws IOException {
-            AgentSession session;
-            ModelOptions modelOptions;
-            CronScheduler cronScheduler;
-            CronQueueProcessor cronQueueProcessor;
-            TeamRuntime teamRuntime;
-            TeamInboxPoller teamInboxPoller;
+            TerminalStyle terminalStyle;
             try {
+                terminalStyle = createTerminalStyle();
+            } catch (IllegalArgumentException e) {
+                spec.commandLine().getErr().println(e.getMessage());
+                return CommandLine.ExitCode.USAGE;
+            }
+            try (ChatConsole chatConsole = new ChatConsole(inputReader, spec.commandLine().getErr(), interactiveApproval, terminalStyle)) {
+                chatConsole.start();
+                AgentSession session;
+                ModelOptions modelOptions;
+                CronScheduler cronScheduler;
+                CronQueueProcessor cronQueueProcessor;
+                TeamRuntime teamRuntime;
+                TeamInboxPoller teamInboxPoller;
                 modelOptions = createModelOptions();
                 ModelClient modelClient = createModelClient();
                 BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.defaults();
                 CronQueue cronQueue = new CronQueue();
                 ScheduledTaskManager scheduledTaskManager = new ScheduledTaskManager(ScheduledJobStore.defaultStore(), cronQueue);
                 TaskManager taskManager = TaskManager.defaultManager();
-                UserApprover userApprover = createUserApprover();
+                UserApprover userApprover = createUserApprover(chatConsole);
                 SkillCatalog skillCatalog = SkillCatalog.scanDefault();
                 MemoryStore memoryStore = MemoryStore.defaultStore();
                 MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
-                printMemoryWarnings(memoryCatalog);
-                printScheduledTaskWarnings(scheduledTaskManager);
+                printMemoryWarnings(memoryCatalog, terminalStyle);
+                printScheduledTaskWarnings(scheduledTaskManager, terminalStyle);
                 teamRuntime = new TeamRuntime(
                         Path.of(""),
                         resolvedAgentName(),
@@ -578,7 +620,7 @@ public final class AgentCli implements Callable<Integer> {
                         createContextManager(),
                         createErrorRecoveryConfig(),
                         backgroundTaskManager,
-                        noTrace ? TraceSink.noop() : stderrTraceSink(spec)
+                        noTrace ? TraceSink.noop() : stderrTraceSink(spec, chatConsole, terminalStyle)
                 ), backgroundTaskManager);
                 teamInboxPoller = new TeamInboxPoller(
                         teamRuntime,
@@ -587,65 +629,84 @@ public final class AgentCli implements Callable<Integer> {
                         systemPrompt,
                         maxSteps,
                         modelOptions,
-                        this::printTeamResult
+                        execution -> {
+                            chatConsole.beforeAsyncOutput();
+                            try {
+                                printTeamResult(execution, terminalStyle);
+                            } finally {
+                                chatConsole.afterAsyncOutput();
+                            }
+                        }
                 );
                 cronScheduler = new CronScheduler(scheduledTaskManager, cronQueue);
                 cronQueueProcessor = new CronQueueProcessor(
                         cronQueue,
                         session,
                         task -> createCronRequest(task, modelOptions),
-                        this::printCronResult
+                        execution -> {
+                            chatConsole.beforeAsyncOutput();
+                            try {
+                                printCronResult(execution, terminalStyle);
+                            } finally {
+                                chatConsole.afterAsyncOutput();
+                            }
+                        }
                 );
-            } catch (IllegalArgumentException | OpenAiCompatibleException e) {
-                spec.commandLine().getErr().println(e.getMessage());
-                return CommandLine.ExitCode.USAGE;
-            }
 
-            cronScheduler.start();
-            cronQueueProcessor.start();
-            teamInboxPoller.start();
-            int lastExitCode = 0;
-            try {
-                while (true) {
-                    if (interactiveApproval) {
-                        spec.commandLine().getErr().print("chat> ");
-                        spec.commandLine().getErr().flush();
-                    }
-                    String line = inputReader.readLine();
-                    if (line == null) {
-                        return lastExitCode;
-                    }
-                    String task = line.strip();
-                    if (task.isBlank()) {
-                        continue;
-                    }
-                    if ("/exit".equals(task) || "/quit".equals(task)) {
-                        return 0;
-                    }
-                    if ("/clear".equals(task)) {
-                        session.clear();
-                        spec.commandLine().getOut().println("Session cleared.");
-                        lastExitCode = 0;
-                        continue;
-                    }
+                cronScheduler.start();
+                cronQueueProcessor.start();
+                teamInboxPoller.start();
+                chatConsole.markEventLoopThread();
+                int lastExitCode = 0;
+                try {
+                    while (true) {
+                        chatConsole.printChatPrompt();
+                        ChatConsole.Event event = chatConsole.nextEvent();
+                        if (event.type() == ChatConsole.EventType.EOF) {
+                            return lastExitCode;
+                        }
+                        if (event.type() == ChatConsole.EventType.ERROR) {
+                            spec.commandLine().getErr().println(terminalStyle.error("failed to read chat input: " + event.error().getMessage()));
+                            return CommandLine.ExitCode.SOFTWARE;
+                        }
+                        String task = event.line().strip();
+                        if (task.isBlank()) {
+                            continue;
+                        }
+                        if ("/exit".equals(task) || "/quit".equals(task)) {
+                            return 0;
+                        }
+                        if ("/clear".equals(task)) {
+                            session.clear();
+                            spec.commandLine().getOut().println(terminalStyle.warning("Session cleared."));
+                            lastExitCode = 0;
+                            continue;
+                        }
 
-                    AgentResult result;
-                    try {
-                        result = session.run(new AgentRequest(task, maxSteps, requestMetadata(), systemPrompt)
-                                .withModelOptions(modelOptions));
-                    } catch (OpenAiCompatibleException e) {
-                        spec.commandLine().getErr().println(e.getMessage());
-                        lastExitCode = CommandLine.ExitCode.SOFTWARE;
-                        continue;
+                        AgentResult result;
+                        try {
+                            result = session.run(new AgentRequest(task, maxSteps, requestMetadata(), systemPrompt)
+                                    .withModelOptions(modelOptions));
+                        } catch (OpenAiCompatibleException e) {
+                            spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
+                            lastExitCode = CommandLine.ExitCode.SOFTWARE;
+                            continue;
+                        }
+                        spec.commandLine().getOut().println(terminalStyle.assistantPrefix() + " " + result.output());
+                        lastExitCode = result.completed() ? 0 : 2;
                     }
-                    spec.commandLine().getOut().println(result.output());
-                    lastExitCode = result.completed() ? 0 : 2;
+                } finally {
+                    teamInboxPoller.close();
+                    teamRuntime.close();
+                    cronQueueProcessor.close();
+                    cronScheduler.close();
                 }
-            } finally {
-                teamInboxPoller.close();
-                teamRuntime.close();
-                cronQueueProcessor.close();
-                cronScheduler.close();
+            } catch (IllegalArgumentException | OpenAiCompatibleException e) {
+                spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
+                return CommandLine.ExitCode.USAGE;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return CommandLine.ExitCode.SOFTWARE;
             }
         }
 
@@ -659,7 +720,7 @@ public final class AgentCli implements Callable<Integer> {
                     .withModelOptions(modelOptions);
         }
 
-        private void printCronResult(CronExecutionResult execution) {
+        private void printCronResult(CronExecutionResult execution, TerminalStyle terminalStyle) {
             String prefix = cronOutputPrefix(execution.task());
             String output;
             if (!execution.success()) {
@@ -671,7 +732,7 @@ public final class AgentCli implements Callable<Integer> {
             }
             java.io.PrintWriter writer = spec.commandLine().getOut();
             synchronized (writer) {
-                writer.println(prefix + " " + output);
+                writer.println(terminalStyle.cronPrefix(prefix) + " " + output);
                 writer.flush();
             }
         }
@@ -684,7 +745,7 @@ public final class AgentCli implements Callable<Integer> {
             return "[cron " + task.job().jobId() + " " + name + "]";
         }
 
-        private void printTeamResult(TeamExecutionResult execution) {
+        private void printTeamResult(TeamExecutionResult execution, TerminalStyle terminalStyle) {
             String prefix = teamOutputPrefix(execution.messages());
             String output;
             if (!execution.success()) {
@@ -696,7 +757,7 @@ public final class AgentCli implements Callable<Integer> {
             }
             java.io.PrintWriter writer = spec.commandLine().getOut();
             synchronized (writer) {
-                writer.println(prefix + " " + output);
+                writer.println(terminalStyle.teamPrefix(prefix) + " " + output);
                 writer.flush();
             }
         }
@@ -708,35 +769,18 @@ public final class AgentCli implements Callable<Integer> {
             return "[team " + messages.get(0).from() + "]";
         }
 
-        private void printScheduledTaskWarnings(ScheduledTaskManager scheduledTaskManager) {
+        private void printScheduledTaskWarnings(ScheduledTaskManager scheduledTaskManager, TerminalStyle terminalStyle) {
             for (String warning : scheduledTaskManager.warnings()) {
-                spec.commandLine().getErr().println("Scheduled task warning: " + warning);
+                spec.commandLine().getErr().println(terminalStyle.warning("Scheduled task warning: " + warning));
             }
         }
 
-        private UserApprover createUserApprover() {
+        private UserApprover createUserApprover(ChatConsole chatConsole) {
             return (request, decision) -> {
                 if (isCronTriggered(request)) {
                     return false;
                 }
-                if (!interactiveApproval) {
-                    return false;
-                }
-                spec.commandLine().getErr().println("Tool approval required:");
-                spec.commandLine().getErr().println("  tool: " + request.toolName());
-                spec.commandLine().getErr().println("  reason: " + decision.reason());
-                if (!decision.riskSummary().isBlank()) {
-                    spec.commandLine().getErr().println("  risk: " + decision.riskSummary());
-                }
-                spec.commandLine().getErr().println("  arguments: " + summarizeArguments(request));
-                spec.commandLine().getErr().print("Allow this tool call? [y/N] ");
-                spec.commandLine().getErr().flush();
-                try {
-                    String line = inputReader.readLine();
-                    return line != null && ("y".equalsIgnoreCase(line.trim()) || "yes".equalsIgnoreCase(line.trim()));
-                } catch (IOException e) {
-                    return false;
-                }
+                return chatConsole.approve(request, decision);
             };
         }
 
@@ -833,10 +877,14 @@ public final class AgentCli implements Callable<Integer> {
             return fixedModelClient == null && "openai-compatible".equals(provider);
         }
 
-        private void printMemoryWarnings(MemoryCatalog memoryCatalog) {
+        private void printMemoryWarnings(MemoryCatalog memoryCatalog, TerminalStyle terminalStyle) {
             for (String warning : memoryCatalog.warnings()) {
-                spec.commandLine().getErr().println("Memory warning: " + warning);
+                spec.commandLine().getErr().println(terminalStyle.warning("Memory warning: " + warning));
             }
+        }
+
+        private TerminalStyle createTerminalStyle() {
+            return TerminalStyle.of(color, interactiveApproval);
         }
 
         private String resolveModel() {
@@ -848,6 +896,274 @@ public final class AgentCli implements Callable<Integer> {
                 return environmentModel.strip();
             }
             return null;
+        }
+    }
+
+    static final class ChatConsole implements AutoCloseable {
+
+        private final BufferedReader inputReader;
+        private final java.io.PrintWriter err;
+        private final boolean interactive;
+        private final TerminalStyle terminalStyle;
+        private final BlockingQueue<Event> events = new LinkedBlockingQueue<>();
+        private final Deque<Event> deferred = new ArrayDeque<>();
+        private final Object approvalLock = new Object();
+        private volatile boolean closed;
+        private volatile boolean waitingForInput;
+        private volatile PendingApproval activeApproval;
+        private boolean promptVisible;
+        private Thread readerThread;
+        private Thread eventLoopThread;
+
+        ChatConsole(BufferedReader inputReader, java.io.PrintWriter err, boolean interactive) {
+            this(inputReader, err, interactive, TerminalStyle.plain());
+        }
+
+        ChatConsole(BufferedReader inputReader, java.io.PrintWriter err, boolean interactive, TerminalStyle terminalStyle) {
+            this.inputReader = Objects.requireNonNull(inputReader, "inputReader must not be null");
+            this.err = Objects.requireNonNull(err, "err must not be null");
+            this.interactive = interactive;
+            this.terminalStyle = Objects.requireNonNull(terminalStyle, "terminalStyle must not be null");
+        }
+
+        void start() {
+            readerThread = new Thread(this::readLoop, "agent-chat-input-reader");
+            readerThread.setDaemon(true);
+            readerThread.start();
+        }
+
+        void markEventLoopThread() {
+            this.eventLoopThread = Thread.currentThread();
+        }
+
+        void printChatPrompt() {
+            if (!interactive) {
+                return;
+            }
+            synchronized (err) {
+                if (promptVisible) {
+                    return;
+                }
+                err.print(terminalStyle.prompt("chat> "));
+                promptVisible = true;
+                err.flush();
+            }
+        }
+
+        Event nextEvent() throws InterruptedException {
+            Event event = deferred.pollFirst();
+            if (event != null) {
+                return prepareEvent(event);
+            }
+            waitingForInput = true;
+            try {
+                return prepareEvent(events.take());
+            } finally {
+                waitingForInput = false;
+            }
+        }
+
+        void beforeAsyncOutput() {
+            if (!interactive) {
+                return;
+            }
+            synchronized (err) {
+                if (promptVisible) {
+                    err.println();
+                    err.flush();
+                    promptVisible = false;
+                }
+            }
+        }
+
+        void afterAsyncOutput() {
+            if (!interactive || !waitingForInput) {
+                return;
+            }
+            synchronized (err) {
+                if (!promptVisible) {
+                    err.print(terminalStyle.prompt("chat> "));
+                    err.flush();
+                    promptVisible = true;
+                }
+            }
+        }
+
+        boolean isWaitingForInput() {
+            return waitingForInput;
+        }
+
+        boolean approve(PermissionRequest request, io.github.mengru.agent.core.permission.PermissionDecision decision) {
+            if (!interactive || closed) {
+                return false;
+            }
+            PendingApproval approval = new PendingApproval(request, decision);
+            try {
+                synchronized (approvalLock) {
+                    while (activeApproval != null && !closed) {
+                        approvalLock.wait();
+                    }
+                    if (closed) {
+                        return false;
+                    }
+                    activeApproval = approval;
+                    beforeAsyncOutput();
+                    printApprovalPrompt(approval);
+                    completeFromQueuedInput(approval);
+                }
+                return approval.result().get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (ExecutionException e) {
+                return false;
+            } finally {
+                synchronized (approvalLock) {
+                    if (activeApproval == approval) {
+                        activeApproval = null;
+                    }
+                    approvalLock.notifyAll();
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            synchronized (approvalLock) {
+                if (activeApproval != null) {
+                    activeApproval.complete(false);
+                    activeApproval = null;
+                }
+                approvalLock.notifyAll();
+            }
+        }
+
+        private Event markPromptConsumed(Event event) {
+            synchronized (err) {
+                promptVisible = false;
+            }
+            return event;
+        }
+
+        private Event prepareEvent(Event event) {
+            return markPromptConsumed(event);
+        }
+
+        private void printApprovalPrompt(PendingApproval approval) {
+            PermissionRequest request = approval.request();
+            io.github.mengru.agent.core.permission.PermissionDecision decision = approval.decision();
+            synchronized (err) {
+                err.println(terminalStyle.warning("Tool approval required:"));
+                if (!request.metadata().getOrDefault("agent.name", "").isBlank()) {
+                    err.println("  requester: " + request.metadata().get("agent.name"));
+                }
+                if (!request.metadata().getOrDefault("agent.trigger", "").isBlank()) {
+                    err.println("  trigger: " + request.metadata().get("agent.trigger"));
+                }
+                if (!request.metadata().getOrDefault("agent.team.role", "").isBlank()) {
+                    err.println("  team role: " + request.metadata().get("agent.team.role"));
+                }
+                err.println("  tool: " + request.toolName());
+                err.println("  reason: " + decision.reason());
+                if (!decision.riskSummary().isBlank()) {
+                    err.println("  risk: " + decision.riskSummary());
+                }
+                err.println("  arguments: " + summarizeArguments(request));
+                err.print(terminalStyle.warning("Allow this tool call? [y/N] "));
+                err.flush();
+            }
+        }
+
+        private void completeFromQueuedInput(PendingApproval approval) {
+            Event event = events.poll();
+            if (event == null || approval.result().isDone()) {
+                return;
+            }
+            if (event.type() == EventType.USER_LINE) {
+                approval.complete(isApprovalYes(event.line()));
+                return;
+            }
+            if (event.type() == EventType.EOF || event.type() == EventType.ERROR) {
+                approval.complete(false);
+            }
+        }
+
+        private static String summarizeArguments(PermissionRequest request) {
+            String value = request.arguments().toString();
+            if (value.length() <= 500) {
+                return value;
+            }
+            return value.substring(0, 500) + "...[truncated]";
+        }
+
+        private void readLoop() {
+            try {
+                while (!closed) {
+                    String line = inputReader.readLine();
+                    if (line == null) {
+                        PendingApproval approval = activeApproval;
+                        if (approval != null && !approval.result().isDone()) {
+                            approval.complete(false);
+                        }
+                        events.offer(Event.eof());
+                        return;
+                    }
+                    PendingApproval approval = activeApproval;
+                    if (approval != null && !approval.result().isDone()) {
+                        approval.complete(isApprovalYes(line));
+                        continue;
+                    }
+                    events.offer(Event.userLine(line));
+                }
+            } catch (IOException e) {
+                events.offer(Event.error(e));
+            }
+        }
+
+        private static boolean isApprovalYes(String line) {
+            String answer = line == null ? "" : line.trim();
+            return "y".equalsIgnoreCase(answer) || "yes".equalsIgnoreCase(answer);
+        }
+
+        enum EventType {
+            USER_LINE,
+            EOF,
+            ERROR
+        }
+
+        record Event(EventType type, String line, PendingApproval approval, IOException error) {
+
+            static Event userLine(String line) {
+                return new Event(EventType.USER_LINE, line == null ? "" : line, null, null);
+            }
+
+            static Event eof() {
+                return new Event(EventType.EOF, "", null, null);
+            }
+
+            static Event error(IOException error) {
+                return new Event(EventType.ERROR, "", null, Objects.requireNonNull(error, "error must not be null"));
+            }
+        }
+
+        record PendingApproval(
+                PermissionRequest request,
+                io.github.mengru.agent.core.permission.PermissionDecision decision,
+                CompletableFuture<Boolean> result
+        ) {
+
+            PendingApproval(PermissionRequest request, io.github.mengru.agent.core.permission.PermissionDecision decision) {
+                this(
+                        Objects.requireNonNull(request, "request must not be null"),
+                        Objects.requireNonNull(decision, "decision must not be null"),
+                        new CompletableFuture<>()
+                );
+            }
+
+            void complete(boolean approved) {
+                result.complete(approved);
+            }
         }
     }
 

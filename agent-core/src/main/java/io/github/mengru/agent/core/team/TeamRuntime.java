@@ -21,17 +21,15 @@ import io.github.mengru.agent.core.tool.ToolRegistry;
 import io.github.mengru.agent.core.trace.TraceSink;
 
 import java.nio.file.Path;
-import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class TeamRuntime implements AutoCloseable {
@@ -41,8 +39,6 @@ public final class TeamRuntime implements AutoCloseable {
     public static final String TEAM_ID_METADATA_KEY = "agent.team.id";
     public static final String TEAM_ROLE_METADATA_KEY = "agent.team.role";
     public static final String TEAM_LEAD_METADATA_KEY = "agent.team.lead";
-
-    private static final Duration PERMISSION_TIMEOUT = Duration.ofSeconds(120);
 
     private final String teamId;
     private final String leadName;
@@ -56,7 +52,6 @@ public final class TeamRuntime implements AutoCloseable {
     private final String userInstructions;
     private final Map<String, String> baseMetadata;
     private final Map<String, TeammateWorker> teammates = new ConcurrentHashMap<>();
-    private final Map<String, PendingPermission> pendingPermissions = new ConcurrentHashMap<>();
     private final AtomicInteger nextTeammateId = new AtomicInteger();
     private volatile boolean closed;
 
@@ -125,14 +120,14 @@ public final class TeamRuntime implements AutoCloseable {
         String sender = normalizeSender(from);
         String recipient = resolveRecipient(to);
         validateMessageDirection(sender, recipient, type);
+        if (type == TeamMessageType.PERMISSION_REQUEST || type == TeamMessageType.PERMISSION_RESPONSE) {
+            throw new IllegalArgumentException(type.value() + " is runtime-managed; do not send it with send_message");
+        }
         JsonNode outgoingPayload = payload == null ? JsonNodeFactory.instance.objectNode() : payload.deepCopy();
         String outgoingContent = content == null ? "" : content.strip();
-        if (type == TeamMessageType.PERMISSION_RESPONSE) {
-            PermissionResponse response = preparePermissionResponse(sender, correlationId, outgoingContent, outgoingPayload);
-            outgoingPayload = response.payload();
-            outgoingContent = response.content();
-        }
-        return sendInternal(type, sender, recipient, outgoingContent, correlationId, outgoingPayload);
+        TeamMessage message = sendInternal(type, sender, recipient, outgoingContent, correlationId, outgoingPayload);
+        markTeammateReportedToLead(sender, recipient);
+        return message;
     }
 
     public List<TeamMessage> consumeLeadMessages() {
@@ -196,8 +191,6 @@ public final class TeamRuntime implements AutoCloseable {
         payload.set("arguments", request.arguments());
         payload.put("reason", decision.reason());
         payload.put("riskSummary", decision.riskSummary());
-        PendingPermission pending = new PendingPermission(request, decision);
-        pendingPermissions.put(correlationId, pending);
         TeammateWorker worker = teammates.get(teammateName);
         if (worker != null) {
             worker.setStatus(TeammateStatus.WAITING_PERMISSION, "waiting for permission " + correlationId);
@@ -210,40 +203,26 @@ public final class TeamRuntime implements AutoCloseable {
                 correlationId,
                 payload
         );
-        TeamMessage response = bus.awaitPermissionResponse(teammateName, correlationId, PERMISSION_TIMEOUT);
-        pendingPermissions.remove(correlationId);
+        boolean approved = humanApprover.approve(request, decision);
+        ObjectNode responsePayload = JsonNodeFactory.instance.objectNode();
+        responsePayload.put("approved", approved);
+        responsePayload.put("toolCallId", request.toolCallId());
+        responsePayload.put("toolName", request.toolName());
+        sendInternal(
+                TeamMessageType.PERMISSION_RESPONSE,
+                leadName,
+                teammateName,
+                approved ? "human approved teammate permission request" : "human rejected teammate permission request",
+                correlationId,
+                responsePayload
+        );
         if (worker != null) {
-            worker.setStatus(TeammateStatus.ACTIVE, "permission response received");
+            worker.setStatus(
+                    TeammateStatus.ACTIVE,
+                    approved ? "permission approved " + correlationId : "permission denied " + correlationId
+            );
         }
-        return response != null
-                && response.payload().path("approved").asBoolean(false);
-    }
-
-    private PermissionResponse preparePermissionResponse(String sender, String correlationId, String content, JsonNode payload) {
-        if (!leadName.equals(sender)) {
-            throw new IllegalArgumentException("only Lead can send permission_response");
-        }
-        if (correlationId == null || correlationId.isBlank()) {
-            throw new IllegalArgumentException("permission_response requires correlationId");
-        }
-        PendingPermission pending = pendingPermissions.get(correlationId);
-        if (pending == null) {
-            throw new IllegalArgumentException("unknown permission request: " + correlationId);
-        }
-        ObjectNode normalized = payload != null && payload.isObject()
-                ? (ObjectNode) payload.deepCopy()
-                : JsonNodeFactory.instance.objectNode();
-        boolean approved = normalized.path("approved").asBoolean(false);
-        String normalizedContent = content;
-        if (approved) {
-            boolean humanApproved = humanApprover.approve(pending.request(), pending.decision());
-            if (!humanApproved) {
-                approved = false;
-                normalizedContent = "human rejected teammate permission request";
-            }
-        }
-        normalized.put("approved", approved);
-        return new PermissionResponse(normalizedContent, normalized);
+        return approved;
     }
 
     private TeamMessage sendInternal(TeamMessageType type, String from, String to, String content, String correlationId, JsonNode payload) {
@@ -252,10 +231,17 @@ public final class TeamRuntime implements AutoCloseable {
         return message;
     }
 
-    private void validateMessageDirection(String from, String to, TeamMessageType type) {
-        if (type == TeamMessageType.PERMISSION_RESPONSE && !leadName.equals(from)) {
-            throw new IllegalArgumentException("permission_response must be sent by Lead");
+    private void markTeammateReportedToLead(String sender, String recipient) {
+        if (!leadName.equals(recipient)) {
+            return;
         }
+        TeammateWorker teammate = teammates.get(sender);
+        if (teammate != null) {
+            teammate.markReportedToLead();
+        }
+    }
+
+    private void validateMessageDirection(String from, String to, TeamMessageType type) {
         if (type == TeamMessageType.SHUTDOWN_REQUEST && !leadName.equals(from)) {
             throw new IllegalArgumentException("shutdown_request must be sent by Lead");
         }
@@ -316,7 +302,9 @@ public final class TeamRuntime implements AutoCloseable {
     private String teammateInstructions(String role, String instructions) {
         String extra = instructions == null || instructions.isBlank() ? "" : "\n\nAdditional teammate instructions:\n" + instructions.strip();
         return "You are teammate " + role + " in team " + teamId
-                + ". Communicate with Lead through send_message. Do not spawn teammates."
+                + ". The runtime automatically reports your final answer to Lead at the end of each assigned turn."
+                + " Use send_message only when you need to ask for direction or send an early blocking update."
+                + " Do not send a routine completion message yourself. Do not spawn teammates."
                 + extra;
     }
 
@@ -333,12 +321,6 @@ public final class TeamRuntime implements AutoCloseable {
         return value.strip();
     }
 
-    private record PendingPermission(PermissionRequest request, PermissionDecision decision) {
-    }
-
-    private record PermissionResponse(String content, JsonNode payload) {
-    }
-
     private final class TeammateWorker implements Runnable {
         private final String name;
         private final String role;
@@ -346,6 +328,7 @@ public final class TeamRuntime implements AutoCloseable {
         private final String instructions;
         private final Instant startedAt = Instant.now();
         private final AgentSession session;
+        private final AtomicBoolean reportedToLeadInCurrentTurn = new AtomicBoolean(false);
         private volatile TeammateStatus status = TeammateStatus.STARTING;
         private volatile String lastMessage = "";
         private volatile boolean running = true;
@@ -406,6 +389,7 @@ public final class TeamRuntime implements AutoCloseable {
 
         private void handleMessage(TeamMessage message) {
             setStatus(TeammateStatus.ACTIVE, "processing " + message.type().value());
+            reportedToLeadInCurrentTurn.set(false);
             AgentResult result = session.run(new AgentRequest(
                     renderTeammateTask(message),
                     TEAMMATE_MAX_STEPS,
@@ -418,8 +402,15 @@ public final class TeamRuntime implements AutoCloseable {
             ObjectNode payload = JsonNodeFactory.instance.objectNode();
             payload.put("completed", result.completed());
             payload.put("sourceMessageId", message.messageId());
-            sendInternal(TeamMessageType.STATUS_UPDATE, name, leadName, content, "", payload);
+            if (!result.completed() || !reportedToLeadInCurrentTurn.get()) {
+                payload.put("status", "final");
+                sendInternal(TeamMessageType.STATUS_UPDATE, name, leadName, content, "", payload);
+            }
             setStatus(TeammateStatus.IDLE, "idle");
+        }
+
+        private void markReportedToLead() {
+            reportedToLeadInCurrentTurn.set(true);
         }
 
         private String renderTeammateTask(TeamMessage message) {

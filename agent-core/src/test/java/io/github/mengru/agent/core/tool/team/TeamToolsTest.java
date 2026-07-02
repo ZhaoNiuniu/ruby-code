@@ -44,6 +44,7 @@ class TeamToolsTest {
             assertThat(result.success()).isTrue();
             JsonNode output = MAPPER.readTree(result.output());
             assertThat(output.path("name").asText()).isEqualTo("worker");
+            assertThat(output.path("initialTaskDelivered").asBoolean()).isTrue();
             ToolResult list = new ListTeammatesTool(runtime).execute(new ToolRequest("list_teammates", JsonNodeFactory.instance.objectNode(), Map.of()));
             assertThat(list.output()).contains("worker").contains("investigator");
         }
@@ -82,6 +83,33 @@ class TeamToolsTest {
             assertThat(messages).hasSize(1);
             assertThat(messages.get(0).to()).isEqualTo(runtime.leadName());
             assertThat(messages.get(0).content()).isEqualTo("hello lead");
+        }
+    }
+
+    @Test
+    void sendMessageSchemaDoesNotExposePermissionProtocolMessages() {
+        try (TeamRuntime runtime = runtime()) {
+            String schema = new SendMessageTool(runtime).parametersSchema().toString();
+
+            assertThat(schema).doesNotContain("permission_request");
+            assertThat(schema).doesNotContain("permission_response");
+        }
+    }
+
+    @Test
+    void sendMessageRejectsPermissionProtocolMessagesAtRuntime() {
+        try (TeamRuntime runtime = runtime()) {
+            SendMessageTool send = new SendMessageTool(runtime);
+            ObjectNode args = JsonNodeFactory.instance.objectNode()
+                    .put("to", "lead")
+                    .put("type", "permission_response")
+                    .put("content", "approved")
+                    .put("correlationId", "perm_test");
+
+            ToolResult result = send.execute(new ToolRequest(send.name(), args, Map.of(TaskManager.AGENT_NAME_METADATA_KEY, "main")));
+
+            assertThat(result.success()).isFalse();
+            assertThat(result.error()).contains("runtime-managed");
         }
     }
 

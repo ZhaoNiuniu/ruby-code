@@ -7,16 +7,22 @@ import io.github.mengru.agent.api.ModelErrorCode;
 import io.github.mengru.agent.api.ModelClient;
 import io.github.mengru.agent.api.ModelException;
 import io.github.mengru.agent.api.Tool;
+import io.github.mengru.agent.api.TraceEvent;
+import io.github.mengru.agent.core.permission.PermissionDecision;
+import io.github.mengru.agent.core.permission.PermissionRequest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import picocli.CommandLine;
 
+import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
 import java.io.PrintWriter;
+import java.io.StringReader;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -398,6 +404,47 @@ class AgentCliTest {
     }
 
     @Test
+    void runColorAlwaysColorsTraceButKeepsFinalAnswerUnprefixed() {
+        StringWriter out = new StringWriter();
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("ok")
+        );
+        commandLine.setOut(new PrintWriter(out));
+        commandLine.setErr(new PrintWriter(err));
+
+        int exitCode = commandLine.execute("run", "--trace", "--color", "always", "hello");
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("ok");
+        assertThat(out.toString()).doesNotContain("assistant>");
+        assertThat(out.toString()).doesNotContain("\u001B[");
+        assertThat(err.toString()).contains("\u001B[2m[trace]\u001B[0m");
+        assertThat(err.toString()).contains("\u001B[32mstatus=success\u001B[0m");
+    }
+
+    @Test
+    void runColorNeverLeavesTracePlain() {
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("ok")
+        );
+        commandLine.setErr(new PrintWriter(err));
+
+        int exitCode = commandLine.execute("run", "--trace", "--color", "never", "hello");
+
+        assertThat(exitCode).isZero();
+        assertThat(err.toString()).contains("[trace] model_call status=start phase=main");
+        assertThat(err.toString()).doesNotContain("\u001B[");
+    }
+
+    @Test
     void runCanDisableErrorRecovery() {
         AtomicInteger calls = new AtomicInteger();
         CommandLine commandLine = AgentCli.newCommandLine(
@@ -479,9 +526,50 @@ class AgentCliTest {
         int exitCode = commandLine.execute("chat");
 
         assertThat(exitCode).isZero();
-        assertThat(out.toString()).contains("ok");
+        assertThat(out.toString()).contains("assistant> ok");
         assertThat(out.toString()).doesNotContain("[trace]");
         assertThat(err.toString()).contains("[trace] model_call status=start phase=main");
+    }
+
+    @Test
+    void chatColorAlwaysColorsAssistantPrefixAndTrace() {
+        StringWriter out = new StringWriter();
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream("hello\n/exit\n".getBytes(StandardCharsets.UTF_8)),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("ok")
+        );
+        commandLine.setOut(new PrintWriter(out));
+        commandLine.setErr(new PrintWriter(err));
+
+        int exitCode = commandLine.execute("chat", "--color", "always");
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("\u001B[32massistant>\u001B[0m ok");
+        assertThat(err.toString()).contains("\u001B[2m[trace]\u001B[0m");
+    }
+
+    @Test
+    void chatColorAutoIsPlainForNonInteractiveInput() {
+        StringWriter out = new StringWriter();
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream("hello\n/exit\n".getBytes(StandardCharsets.UTF_8)),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("ok")
+        );
+        commandLine.setOut(new PrintWriter(out));
+        commandLine.setErr(new PrintWriter(err));
+
+        int exitCode = commandLine.execute("chat", "--color", "auto");
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("assistant> ok");
+        assertThat(out.toString()).doesNotContain("\u001B[");
+        assertThat(err.toString()).doesNotContain("\u001B[");
     }
 
     @Test
@@ -502,6 +590,132 @@ class AgentCliTest {
         assertThat(exitCode).isZero();
         assertThat(out.toString()).contains("ok");
         assertThat(err.toString()).doesNotContain("[trace]");
+    }
+
+    @Test
+    void terminalStyleColorsTraceStatusesWithoutColoringPayloads() {
+        TerminalStyle style = TerminalStyle.of("always", false);
+
+        String success = style.trace(TraceEvent.of(TraceEvent.Type.TOOL_RESULT, Map.of(
+                "success", "true",
+                "summary", "plain payload"
+        )));
+        String failure = style.trace(TraceEvent.of(TraceEvent.Type.MODEL_CALL, Map.of(
+                "status", "failed",
+                "error", "TRANSIENT"
+        )));
+        String compression = style.trace(TraceEvent.of(TraceEvent.Type.COMPRESSION, Map.of(
+                "stage", "MICRO_COMPACT"
+        )));
+
+        assertThat(success).contains("\u001B[32msuccess=true\u001B[0m");
+        assertThat(success).contains("summary=\"plain payload\"");
+        assertThat(success).doesNotContain("\u001B[32msummary");
+        assertThat(failure).contains("\u001B[31mstatus=failed\u001B[0m");
+        assertThat(compression).startsWith("\u001B[34m");
+    }
+
+    @Test
+    void terminalStyleColorsTeamAndCronPrefixesOnly() {
+        TerminalStyle style = TerminalStyle.of("always", false);
+
+        assertThat(style.teamPrefix("[team alice]") + " done")
+                .isEqualTo("\u001B[35m[team alice]\u001B[0m done");
+        assertThat(style.cronPrefix("[cron job_1]") + " done")
+                .isEqualTo("\u001B[34m[cron job_1]\u001B[0m done");
+    }
+
+    @Test
+    void chatConsoleRoutesBackgroundApprovalWithoutEventLoopDispatch() throws Exception {
+        PipedInputStream input = new PipedInputStream();
+        PipedOutputStream output = new PipedOutputStream(input);
+        StringWriter err = new StringWriter();
+        AtomicReference<Boolean> approved = new AtomicReference<>();
+
+        try (AgentCli.ChatConsole console = new AgentCli.ChatConsole(
+                new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8)),
+                new PrintWriter(err),
+                true
+        )) {
+            console.start();
+            console.markEventLoopThread();
+            console.printChatPrompt();
+            Thread backgroundApproval = new Thread(() -> approved.set(console.approve(
+                    permissionRequest("bash", JsonNodeFactory.instance.objectNode().put("command", "ls")),
+                    PermissionDecision.askUser("bash executes a workspace command", "command=ls")
+            )));
+            backgroundApproval.setDaemon(true);
+            backgroundApproval.start();
+
+            awaitText(err, "Tool approval required:");
+            output.write("y\nhello after approval\n".getBytes(StandardCharsets.UTF_8));
+            output.flush();
+            backgroundApproval.join(2000);
+
+            assertThat(approved.get()).isTrue();
+            AgentCli.ChatConsole.Event nextUserEvent = console.nextEvent();
+            assertThat(nextUserEvent.type()).isEqualTo(AgentCli.ChatConsole.EventType.USER_LINE);
+            assertThat(nextUserEvent.line()).isEqualTo("hello after approval");
+            assertThat(err.toString()).contains("chat> \nTool approval required:");
+        } finally {
+            output.close();
+        }
+    }
+
+    @Test
+    void chatConsoleSeparatesAsyncOutputFromVisiblePrompt() {
+        StringWriter err = new StringWriter();
+        try (AgentCli.ChatConsole console = new AgentCli.ChatConsole(
+                new BufferedReader(new StringReader("")),
+                new PrintWriter(err),
+                true
+        )) {
+            console.printChatPrompt();
+
+            console.beforeAsyncOutput();
+            console.beforeAsyncOutput();
+
+            assertThat(err.toString()).isEqualTo("chat> \n");
+        }
+    }
+
+    @Test
+    void chatConsoleRepaintsPromptAfterAsyncOutputWhileWaiting() throws Exception {
+        PipedInputStream input = new PipedInputStream();
+        PipedOutputStream output = new PipedOutputStream(input);
+        StringWriter err = new StringWriter();
+        AtomicReference<AgentCli.ChatConsole.Event> eventRef = new AtomicReference<>();
+
+        try (AgentCli.ChatConsole console = new AgentCli.ChatConsole(
+                new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8)),
+                new PrintWriter(err),
+                true
+        )) {
+            console.start();
+            console.printChatPrompt();
+            Thread waiter = new Thread(() -> {
+                try {
+                    eventRef.set(console.nextEvent());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            waiter.setDaemon(true);
+            waiter.start();
+            awaitWaitingForInput(console);
+
+            console.beforeAsyncOutput();
+            err.append("[team alice] done\n");
+            console.afterAsyncOutput();
+            output.write("hello\n".getBytes(StandardCharsets.UTF_8));
+            output.flush();
+            waiter.join(2000);
+
+            assertThat(err.toString()).contains("chat> \n[team alice] done\nchat> ");
+            assertThat(eventRef.get().line()).isEqualTo("hello");
+        } finally {
+            output.close();
+        }
     }
 
     @Test
@@ -744,6 +958,22 @@ class AgentCliTest {
             Thread.sleep(millis);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    private static PermissionRequest permissionRequest(String toolName, ObjectNode arguments) {
+        return new PermissionRequest("call-test", toolName, arguments, Map.of());
+    }
+
+    private static void awaitText(StringWriter writer, String text) throws InterruptedException {
+        for (int i = 0; i < 50 && !writer.toString().contains(text); i++) {
+            Thread.sleep(20);
+        }
+    }
+
+    private static void awaitWaitingForInput(AgentCli.ChatConsole console) throws InterruptedException {
+        for (int i = 0; i < 50 && !console.isWaitingForInput(); i++) {
+            Thread.sleep(20);
         }
     }
 

@@ -28,7 +28,7 @@ public final class SpawnTeammateTool implements Tool {
 
     @Override
     public String description() {
-        return "Start a persistent teammate thread in agent chat with its own inbox and context.";
+        return "Start a persistent teammate thread in agent chat and deliver its initial task automatically.";
     }
 
     @Override
@@ -37,7 +37,7 @@ public final class SpawnTeammateTool implements Tool {
         ObjectNode properties = (ObjectNode) schema.get("properties");
         properties.set("name", TeamToolSupport.stringProperty("Optional teammate name. Uses teammate_1 style if omitted."));
         properties.set("role", TeamToolSupport.stringProperty("Teammate role, for example backend-investigator."));
-        properties.set("task", TeamToolSupport.stringProperty("Initial task assignment for the teammate."));
+        properties.set("task", TeamToolSupport.stringProperty("Initial task assignment for the teammate. It is delivered automatically when the teammate is spawned."));
         properties.set("instructions", TeamToolSupport.stringProperty("Optional extra instructions for the teammate."));
         schema.putArray("required").add("role").add("task");
         return schema;
@@ -58,6 +58,7 @@ public final class SpawnTeammateTool implements Tool {
             output.put("name", teammate.name());
             output.put("role", teammate.role());
             output.put("status", teammate.status().name().toLowerCase(java.util.Locale.ROOT));
+            output.put("initialTaskDelivered", true);
             return ToolResult.success(output.toPrettyString());
         } catch (RuntimeException e) {
             return ToolResult.failure(e.getMessage());

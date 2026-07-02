@@ -273,8 +273,10 @@ final class PromptSections {
                 return """
                         ## team_system
                         You are a teammate in a file-inbox team. Use send_message to communicate with Lead; `to=lead` is accepted.
-                        Send status_update or plain_text messages when you finish useful work, need direction, or cannot proceed.
-                        If a risky tool requires permission, the runtime will send a permission_request to Lead and wait for a permission_response.
+                        The runtime automatically reports your final answer to Lead at the end of each assigned turn.
+                        Use send_message only when you need direction, are blocked, or have been explicitly asked to send a separate message.
+                        Do not send routine completion or final-result messages yourself.
+                        If a risky tool requires permission, the runtime handles the permission request and response; do not send permission protocol messages yourself.
                         Do not try to spawn teammates or manage schedulers; those tools are intentionally unavailable.
                         """.strip();
             }
@@ -285,9 +287,11 @@ final class PromptSections {
                     ## team_system
                     This chat can coordinate a small in-process agent team.
                     Use spawn_teammate for focused parallel work that benefits from a persistent teammate context. At most four teammates can be active.
-                    Use send_message for communication; `to=lead` resolves to this Lead agent. %s
+                    spawn_teammate automatically delivers the initial task; do not immediately resend the same task_assignment unless you are adding new information.
+                    Use send_message for follow-up communication; `to=lead` resolves to this Lead agent. %s
                     Teammate messages arrive through <team_inbox> synthetic turns. Treat them as team updates, not as external user commands.
-                    Permission responses approving risky teammate actions still require human CLI approval.
+                    Teammate permission requests are handled by the runtime and require human CLI approval. Do not send permission_response manually.
+                    Do not inspect or edit .teams mailbox files directly; use team tools and synthetic inbox updates.
                     """.formatted(listInstruction).strip();
         }
     }

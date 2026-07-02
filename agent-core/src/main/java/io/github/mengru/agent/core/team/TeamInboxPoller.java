@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +29,7 @@ public final class TeamInboxPoller implements AutoCloseable {
     private final ModelOptions modelOptions;
     private final Consumer<TeamExecutionResult> resultConsumer;
     private final Duration pollInterval;
+    private final Duration debounceInterval;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread thread;
 
@@ -40,7 +42,7 @@ public final class TeamInboxPoller implements AutoCloseable {
             ModelOptions modelOptions,
             Consumer<TeamExecutionResult> resultConsumer
     ) {
-        this(runtime, session, metadataSupplier, systemPrompt, maxSteps, modelOptions, resultConsumer, Duration.ofSeconds(1));
+        this(runtime, session, metadataSupplier, systemPrompt, maxSteps, modelOptions, resultConsumer, Duration.ofSeconds(1), Duration.ofMillis(500));
     }
 
     TeamInboxPoller(
@@ -53,6 +55,20 @@ public final class TeamInboxPoller implements AutoCloseable {
             Consumer<TeamExecutionResult> resultConsumer,
             Duration pollInterval
     ) {
+        this(runtime, session, metadataSupplier, systemPrompt, maxSteps, modelOptions, resultConsumer, pollInterval, Duration.ZERO);
+    }
+
+    TeamInboxPoller(
+            TeamRuntime runtime,
+            AgentSession session,
+            Supplier<Map<String, String>> metadataSupplier,
+            String systemPrompt,
+            int maxSteps,
+            ModelOptions modelOptions,
+            Consumer<TeamExecutionResult> resultConsumer,
+            Duration pollInterval,
+            Duration debounceInterval
+    ) {
         this.runtime = Objects.requireNonNull(runtime, "runtime must not be null");
         this.session = Objects.requireNonNull(session, "session must not be null");
         this.metadataSupplier = Objects.requireNonNull(metadataSupplier, "metadataSupplier must not be null");
@@ -61,6 +77,7 @@ public final class TeamInboxPoller implements AutoCloseable {
         this.modelOptions = modelOptions == null ? ModelOptions.defaults() : modelOptions;
         this.resultConsumer = Objects.requireNonNull(resultConsumer, "resultConsumer must not be null");
         this.pollInterval = Objects.requireNonNull(pollInterval, "pollInterval must not be null");
+        this.debounceInterval = Objects.requireNonNull(debounceInterval, "debounceInterval must not be null");
     }
 
     public void start() {
@@ -81,14 +98,15 @@ public final class TeamInboxPoller implements AutoCloseable {
         while (running.get()) {
             try {
                 List<TeamMessage> messages = runtime.consumeLeadMessages();
-                if (!messages.isEmpty()) {
+                List<TeamMessage> modelVisibleMessages = collectModelVisibleMessages(messages);
+                if (!modelVisibleMessages.isEmpty()) {
                     AgentResult result = session.run(new AgentRequest(
-                            runtime.renderLeadInbox(messages),
+                            runtime.renderLeadInbox(modelVisibleMessages),
                             maxSteps,
                             teamMetadata(),
                             systemPrompt
                     ).withModelOptions(modelOptions));
-                    resultConsumer.accept(new TeamExecutionResult(messages, result, true, ""));
+                    resultConsumer.accept(new TeamExecutionResult(modelVisibleMessages, result, true, ""));
                 }
                 Thread.sleep(pollInterval.toMillis());
             } catch (InterruptedException e) {
@@ -99,6 +117,29 @@ public final class TeamInboxPoller implements AutoCloseable {
                 resultConsumer.accept(new TeamExecutionResult(List.of(), null, false, e.getMessage()));
             }
         }
+    }
+
+    private List<TeamMessage> collectModelVisibleMessages(List<TeamMessage> messages) throws InterruptedException {
+        ArrayList<TeamMessage> visibleMessages = new ArrayList<>(modelVisible(messages));
+        if (visibleMessages.isEmpty()) {
+            return List.of();
+        }
+        if (!debounceInterval.isZero() && !debounceInterval.isNegative()) {
+            Thread.sleep(debounceInterval.toMillis());
+            visibleMessages.addAll(modelVisible(runtime.consumeLeadMessages()));
+        }
+        return List.copyOf(visibleMessages);
+    }
+
+    private static List<TeamMessage> modelVisible(List<TeamMessage> messages) {
+        return messages.stream()
+                .filter(TeamInboxPoller::isModelVisible)
+                .toList();
+    }
+
+    private static boolean isModelVisible(TeamMessage message) {
+        return message.type() != TeamMessageType.PERMISSION_REQUEST
+                && message.type() != TeamMessageType.PERMISSION_RESPONSE;
     }
 
     private Map<String, String> teamMetadata() {

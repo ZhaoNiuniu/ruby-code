@@ -29,7 +29,7 @@ public final class SendMessageTool implements Tool {
 
     @Override
     public String description() {
-        return "Send a structured message to Lead or a teammate through the team file inbox.";
+        return "Send an explicit team message through the file inbox. Teammate routine completion is auto-reported by the runtime.";
     }
 
     @Override
@@ -42,17 +42,15 @@ public final class SendMessageTool implements Tool {
                 .add("plain_text")
                 .add("task_assignment")
                 .add("status_update")
-                .add("permission_request")
-                .add("permission_response")
                 .add("shutdown_request")
                 .add("shutdown_ack")
                 .add("teammate_terminated");
         properties.set("type", type);
         properties.set("content", TeamToolSupport.stringProperty("Human-readable message content."));
-        properties.set("correlationId", TeamToolSupport.stringProperty("Optional correlation id for permission responses."));
+        properties.set("correlationId", TeamToolSupport.stringProperty("Optional correlation id for message correlation."));
         ObjectNode payload = JsonNodeFactory.instance.objectNode();
         payload.put("type", "object");
-        payload.put("description", "Optional structured payload. For permission_response include approved=true|false.");
+        payload.put("description", "Optional structured payload.");
         properties.set("payload", payload);
         schema.putArray("required").add("to").add("type").add("content");
         return schema;

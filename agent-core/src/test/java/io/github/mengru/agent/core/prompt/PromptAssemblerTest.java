@@ -1,9 +1,14 @@
 package io.github.mengru.agent.core.prompt;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import io.github.mengru.agent.api.AgentMemory;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentStep;
 import io.github.mengru.agent.api.ConversationMessage;
+import io.github.mengru.agent.api.Tool;
+import io.github.mengru.agent.api.ToolRequest;
+import io.github.mengru.agent.api.ToolResult;
 import io.github.mengru.agent.core.memory.MemoryCatalog;
 import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.skill.SkillCatalog;
@@ -224,6 +229,29 @@ class PromptAssemblerTest {
     }
 
     @Test
+    void promptIncludesMcpGuidanceOnlyWhenMcpToolsAreEnabled() {
+        AgentRequest withoutMcp = assemble(
+                PromptMode.MAIN,
+                ToolRegistry.defaultTools(),
+                MemoryCatalog.empty(workspace),
+                SkillCatalog.empty(),
+                AgentRequest.of("inspect")
+        );
+        AgentRequest withMcp = assemble(
+                PromptMode.MAIN,
+                ToolRegistry.builder().add(new TestTool("mcp__demo__echo")).build(),
+                MemoryCatalog.empty(workspace),
+                SkillCatalog.empty(),
+                AgentRequest.of("inspect")
+        );
+
+        assertThat(withoutMcp.systemPrompt()).doesNotContain("## mcp_tools");
+        assertThat(withMcp.systemPrompt()).contains("## mcp_tools");
+        assertThat(withMcp.systemPrompt()).contains("external MCP server processes");
+        assertThat(withMcp.systemPrompt()).contains("require user approval");
+    }
+
+    @Test
     void teammatePromptUsesTeammateIdentityAndSendMessageGuidance() {
         try (TeamRuntime teamRuntime = teamRuntime()) {
             ToolRegistry tools = ToolRegistry.teammateTools(teamRuntime, new TaskManager(workspace));
@@ -313,5 +341,23 @@ class PromptAssemblerTest {
                 "",
                 Map.of(TaskManager.AGENT_NAME_METADATA_KEY, "main")
         );
+    }
+
+    private record TestTool(String name) implements Tool {
+
+        @Override
+        public String description() {
+            return "test tool";
+        }
+
+        @Override
+        public JsonNode parametersSchema() {
+            return JsonNodeFactory.instance.objectNode().put("type", "object");
+        }
+
+        @Override
+        public ToolResult execute(ToolRequest request) {
+            return ToolResult.success("ok");
+        }
     }
 }

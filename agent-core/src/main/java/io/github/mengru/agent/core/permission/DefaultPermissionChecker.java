@@ -28,6 +28,9 @@ public final class DefaultPermissionChecker implements PermissionChecker {
     @Override
     public PermissionDecision check(PermissionRequest request) {
         Objects.requireNonNull(request, "request must not be null");
+        if (request.toolName().startsWith("mcp__")) {
+            return checkMcpTool(request);
+        }
         return switch (request.toolName()) {
             case "subagent" -> PermissionDecision.allow();
             case "todo_write" -> PermissionDecision.allow();
@@ -41,6 +44,20 @@ public final class DefaultPermissionChecker implements PermissionChecker {
             case "bash" -> checkBash(request);
             default -> PermissionDecision.allow();
         };
+    }
+
+    private PermissionDecision checkMcpTool(PermissionRequest request) {
+        String[] parts = request.toolName().split("__", 3);
+        String server = parts.length > 1 ? parts[1] : "unknown";
+        String tool = parts.length > 2 ? parts[2] : request.toolName();
+        String args = request.arguments().toString();
+        if (args.length() > 500) {
+            args = args.substring(0, 500) + "...[truncated]";
+        }
+        return PermissionDecision.askUser(
+                "MCP tool calls execute in an external server process",
+                "server=" + server + ", tool=" + tool + ", arguments=" + args
+        );
     }
 
     private PermissionDecision checkPathTool(PermissionRequest request, boolean askAfterHardChecks) {

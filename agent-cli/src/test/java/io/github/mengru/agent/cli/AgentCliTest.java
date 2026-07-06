@@ -1,5 +1,6 @@
 package io.github.mengru.agent.cli;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.mengru.agent.api.AgentStep;
@@ -27,13 +28,17 @@ import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class AgentCliTest {
+
+    private static final ObjectMapper TEST_MAPPER = new ObjectMapper();
 
     @TempDir
     Path workspace;
@@ -286,6 +291,89 @@ class AgentCliTest {
         assertThat(toolNames.get()).contains("schedule_task", "list_scheduled_tasks", "cancel_scheduled_task");
         assertThat(toolNames.get()).contains("spawn_teammate", "send_message", "list_teammates");
         assertThat(toolNames.get()).contains("create_task", "list_tasks", "get_task", "can_start", "claim_task", "complete_task");
+    }
+
+    @Test
+    void runLoadsMcpToolsFromConfigAndRequiresApproval() throws IOException {
+        Path config = writeMcpConfig("demo", Map.of());
+        StringWriter out = new StringWriter();
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream("y\n".getBytes(StandardCharsets.UTF_8)),
+                true,
+                mcpEchoModel("from run")
+        );
+        commandLine.setOut(new PrintWriter(out));
+        commandLine.setErr(new PrintWriter(err));
+
+        int exitCode = commandLine.execute("run", "--mcp-config", config.toString(), "--max-steps", "3", "use", "mcp");
+
+        assertThat(exitCode).isZero();
+        assertThat(err.toString()).contains("MCP tool calls execute in an external server process");
+        assertThat(err.toString()).contains("server=demo, tool=echo");
+        assertThat(out.toString()).contains("mcp echo: from run");
+    }
+
+    @Test
+    void runNoMcpSkipsConfigLoading() {
+        AtomicReference<List<String>> toolNames = new AtomicReference<>();
+        StringWriter out = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                (request, previousSteps, tools) -> {
+                    toolNames.set(tools.stream().map(Tool::name).toList());
+                    return AgentStep.finalAnswer("no mcp");
+                }
+        );
+        commandLine.setOut(new PrintWriter(out));
+
+        int exitCode = commandLine.execute("run", "--no-mcp", "--mcp-config", "../outside-mcp.json", "inspect");
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("no mcp");
+        assertThat(toolNames.get()).doesNotContain("mcp__demo__echo");
+    }
+
+    @Test
+    void runRejectsMcpConfigOutsideWorkspace() {
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("unused")
+        );
+        commandLine.setErr(new PrintWriter(err));
+
+        int exitCode = commandLine.execute("run", "--mcp-config", "../outside-mcp.json", "inspect");
+
+        assertThat(exitCode).isEqualTo(CommandLine.ExitCode.USAGE);
+        assertThat(err.toString()).contains("MCP config path must stay within the workspace");
+    }
+
+    @Test
+    void chatStartsMcpServerOnceAndReusesItAcrossClear() throws IOException {
+        Path startFile = Path.of("target", "cli-mcp-tests", "starts-" + UUID.randomUUID() + ".txt");
+        Path config = writeMcpConfig("demo", Map.of("MCP_FAKE_START_FILE", startFile.toString()));
+        StringWriter out = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream("first\ny\n/clear\nsecond\ny\n/exit\n".getBytes(StandardCharsets.UTF_8)),
+                true,
+                mcpEchoModel(null)
+        );
+        commandLine.setOut(new PrintWriter(out));
+
+        int exitCode = commandLine.execute("chat", "--no-trace", "--mcp-config", config.toString(), "--max-steps", "3");
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("mcp echo: first");
+        assertThat(out.toString()).contains("Session cleared.");
+        assertThat(out.toString()).contains("mcp echo: second");
+        assertThat(Files.readAllLines(startFile)).hasSize(1);
     }
 
     @Test
@@ -641,13 +729,23 @@ class AgentCliTest {
             console.markEventLoopThread();
             console.printChatPrompt();
             Thread backgroundApproval = new Thread(() -> approved.set(console.approve(
-                    permissionRequest("bash", JsonNodeFactory.instance.objectNode().put("command", "ls")),
+                    permissionRequest(
+                            "bash",
+                            JsonNodeFactory.instance.objectNode().put("command", "ls"),
+                            Map.of(
+                                    "agent.permission.reviewer", "main",
+                                    "agent.permission.review.reason", "Lead review accepted the teammate request"
+                            )
+                    ),
                     PermissionDecision.askUser("bash executes a workspace command", "command=ls")
             )));
             backgroundApproval.setDaemon(true);
             backgroundApproval.start();
 
             awaitText(err, "Tool approval required:");
+            String approvalPrompt = err.toString();
+            console.printChatPrompt();
+            assertThat(err.toString()).isEqualTo(approvalPrompt);
             output.write("y\nhello after approval\n".getBytes(StandardCharsets.UTF_8));
             output.flush();
             backgroundApproval.join(2000);
@@ -657,6 +755,8 @@ class AgentCliTest {
             assertThat(nextUserEvent.type()).isEqualTo(AgentCli.ChatConsole.EventType.USER_LINE);
             assertThat(nextUserEvent.line()).isEqualTo("hello after approval");
             assertThat(err.toString()).contains("chat> \nTool approval required:");
+            assertThat(err.toString()).contains("reviewed by: main");
+            assertThat(err.toString()).contains("review: Lead review accepted the teammate request");
         } finally {
             output.close();
         }
@@ -676,6 +776,48 @@ class AgentCliTest {
             console.beforeAsyncOutput();
 
             assertThat(err.toString()).isEqualTo("chat> \n");
+        }
+    }
+
+    @Test
+    void chatConsoleDoesNotRepaintPromptAfterTraceOutputWhileWaiting() throws Exception {
+        PipedInputStream input = new PipedInputStream();
+        PipedOutputStream output = new PipedOutputStream(input);
+        StringWriter err = new StringWriter();
+        AtomicReference<AgentCli.ChatConsole.Event> eventRef = new AtomicReference<>();
+
+        try (AgentCli.ChatConsole console = new AgentCli.ChatConsole(
+                new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8)),
+                new PrintWriter(err),
+                true
+        )) {
+            console.start();
+            console.printChatPrompt();
+            Thread waiter = new Thread(() -> {
+                try {
+                    eventRef.set(console.nextEvent());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            waiter.setDaemon(true);
+            waiter.start();
+            awaitWaitingForInput(console);
+
+            console.beforeAsyncOutput();
+            err.append("[trace] model_call status=start\n");
+            console.afterAsyncOutput(false);
+
+            assertThat(err.toString()).contains("chat> \n[trace] model_call status=start\n");
+            assertThat(err.toString()).doesNotContain("[trace] model_call status=start\nchat> ");
+
+            output.write("hello\n".getBytes(StandardCharsets.UTF_8));
+            output.flush();
+            waiter.join(1000);
+
+            assertThat(eventRef.get().line()).isEqualTo("hello");
+        } finally {
+            output.close();
         }
     }
 
@@ -821,19 +963,32 @@ class AgentCliTest {
     }
 
     @Test
-    void chatInjectsCompletedBackgroundTaskNotificationAfterClear() {
+    void chatInjectsCompletedBackgroundTaskNotificationAfterClear() throws Exception {
+        PipedInputStream input = new PipedInputStream();
+        PipedOutputStream output = new PipedOutputStream(input);
         StringWriter out = new StringWriter();
         CommandLine commandLine = AgentCli.newCommandLine(
                 Map.of(),
-                new ByteArrayInputStream("start\ny\n/clear\nsecond\n".getBytes(StandardCharsets.UTF_8)),
+                input,
                 true,
                 backgroundBashChatModel()
         );
         commandLine.setOut(new PrintWriter(out));
 
-        int exitCode = commandLine.execute("chat", "--max-steps", "3");
+        AtomicReference<Integer> exitCode = new AtomicReference<>();
+        Thread cliThread = new Thread(() -> exitCode.set(commandLine.execute("chat", "--max-steps", "3")));
+        cliThread.setDaemon(true);
+        cliThread.start();
 
-        assertThat(exitCode).isZero();
+        output.write("start\ny\n/clear\n".getBytes(StandardCharsets.UTF_8));
+        output.flush();
+        awaitText(out, "Session cleared.");
+        Thread.sleep(250);
+        output.write("second\n".getBytes(StandardCharsets.UTF_8));
+        output.close();
+        cliThread.join(3000);
+
+        assertThat(exitCode.get()).isZero();
         assertThat(out.toString()).contains("background task started");
         assertThat(out.toString()).contains("Session cleared.");
         assertThat(out.toString()).contains("notifications=1");
@@ -883,6 +1038,39 @@ class AgentCliTest {
 
         assertThat(exitCode).isZero();
         assertThat(out.toString()).contains("Use tabs instead of spaces.");
+    }
+
+    private static Path writeMcpConfig(String serverName, Map<String, String> env) throws IOException {
+        Path dir = Path.of("target", "cli-mcp-tests", UUID.randomUUID().toString());
+        Files.createDirectories(dir);
+        Path config = dir.resolve("mcp.json");
+        ObjectNode root = JsonNodeFactory.instance.objectNode();
+        ObjectNode server = root.putObject("mcpServers").putObject(serverName);
+        server.put("command", javaBinary());
+        server.putArray("args")
+                .add("-cp")
+                .add(System.getProperty("java.class.path"))
+                .add(FakeMcpServer.class.getName());
+        ObjectNode envNode = server.putObject("env");
+        env.forEach(envNode::put);
+        Files.writeString(config, TEST_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root), StandardCharsets.UTF_8);
+        return config;
+    }
+
+    private static String javaBinary() {
+        return Path.of(System.getProperty("java.home"), "bin", "java").toString();
+    }
+
+    private static ModelClient mcpEchoModel(String fixedText) {
+        AtomicInteger calls = new AtomicInteger();
+        return (request, previousSteps, tools) -> {
+            if (previousSteps.isEmpty()) {
+                ObjectNode arguments = JsonNodeFactory.instance.objectNode();
+                arguments.put("text", fixedText == null ? request.task() : fixedText);
+                return AgentStep.toolCall("call-mcp-" + calls.incrementAndGet(), "mcp__demo__echo", arguments);
+            }
+            return AgentStep.finalAnswer(previousSteps.get(previousSteps.size() - 1).content());
+        };
     }
 
     private static ModelClient writeFileModel(String path) {
@@ -962,7 +1150,11 @@ class AgentCliTest {
     }
 
     private static PermissionRequest permissionRequest(String toolName, ObjectNode arguments) {
-        return new PermissionRequest("call-test", toolName, arguments, Map.of());
+        return permissionRequest(toolName, arguments, Map.of());
+    }
+
+    private static PermissionRequest permissionRequest(String toolName, ObjectNode arguments, Map<String, String> metadata) {
+        return new PermissionRequest("call-test", toolName, arguments, metadata);
     }
 
     private static void awaitText(StringWriter writer, String text) throws InterruptedException {

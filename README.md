@@ -5,6 +5,7 @@
 
 - `agent-api`: public SDK contracts for agents, model clients, tools, requests, results, and steps.
 - `agent-core`: a minimal ReAct-style tool loop with local command/file tools and an echo model client.
+- `agent-mcp`: a stdio MCP client that adapts external MCP tools into the local Tool API.
 - `agent-provider-openai-compatible`: an OpenAI-compatible Chat Completions provider with native tool calling.
 - `agent-cli`: a picocli-based command line entry point for local smoke tests.
 
@@ -92,6 +93,34 @@ java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar chat \
 ```
 
 `agent chat` uses a 10-turn short-term window for successful user/assistant turns. Once that window is exceeded, older turns are folded into compressed memory and the most recent turns remain as plain conversation history. It does not persist sessions across processes and it does not carry tool traces into the next turn. Use `/clear` to reset the current session history and compressed session memory, and `/exit` or `/quit` to leave chat. `/clear` does not cancel background tasks.
+
+## MCP Tools
+
+`agent run` and `agent chat` check for a project-local `.mcp.json` by default. v1 supports stdio MCP servers only and adapts remote `tools/list` results into normal agent tools named:
+
+```text
+mcp__{serverName}__{toolName}
+```
+
+Claude-style config is supported:
+
+```json
+{
+  "mcpServers": {
+    "local_demo": {
+      "command": "node",
+      "args": ["server.js"],
+      "env": {
+        "TOKEN": "..."
+      }
+    }
+  }
+}
+```
+
+Use `--no-mcp` to disable MCP loading, or `--mcp-config <path>` to point at another config file inside the workspace. `agent run` starts configured MCP servers for that command and closes them before exit. `agent chat` starts them once at chat startup, reuses them through the session, and does not reload them on `/clear`.
+
+MCP tools are exposed only to the main/Lead agent in v1. Subagents and teammates do not receive MCP tools. Every MCP call requires user approval, even if an MCP server advertises annotations that imply read-only or safe behavior.
 
 ## Background Tasks
 
@@ -181,7 +210,7 @@ Messages from teammates are consumed by a Lead inbox poller and delivered as syn
 
 ## System Prompt Assembly
 
-The final system prompt is assembled at runtime from sections instead of being hardcoded as one string. Core sections include identity, runtime model identity, user instructions, workspace, enabled tools, task system guidance, team guidance, persistent memory index, project skill catalog, todo planning guidance, and compressed session memory.
+The final system prompt is assembled at runtime from sections instead of being hardcoded as one string. Core sections include identity, runtime model identity, user instructions, workspace, enabled tools, MCP tool guidance when MCP tools exist, task system guidance, team guidance, persistent memory index, project skill catalog, todo planning guidance, and compressed session memory.
 
 Sections load from real runtime state: provider/model metadata comes from CLI configuration, enabled tools come from `ToolRegistry`, skills from the startup `skills/` scan, and long-term memory from the startup `.memory/` scan. The assembler caches identical system prompts inside the current agent runtime. Relevant long-term memory file contents are injected into the current user turn, not the system prompt, so the stable system sections remain cache-friendly.
 
@@ -290,7 +319,7 @@ Invalid memory files are skipped with warnings instead of failing startup. v1 do
 
 ## Default Tools
 
-`ToolRegistry.defaultTools()` registers `todo_write`, task tools, and five local tools. The CLI uses the runtime default registry, which also includes `subagent` because it needs the active model client. In `agent chat`, the runtime registry also adds scheduler tools and team tools. When the project has a non-empty `skills/` catalog, the runtime registry also includes `load_skill`.
+`ToolRegistry.defaultTools()` registers `todo_write`, task tools, and five local tools. The CLI uses the runtime default registry, which also includes `subagent` because it needs the active model client. In `agent chat`, the runtime registry also adds scheduler tools and team tools. When the project has a non-empty `skills/` catalog, the runtime registry also includes `load_skill`. When MCP is enabled and `.mcp.json` has configured stdio servers, the main/Lead registry appends `mcp__...` tools after local tools.
 
 - `todo_write`: create or replace the agent's planning todo list. It does not read files, run commands, or perform work.
 - `load_skill`: load the full `SKILL.md` content for a project skill by name. It is read-only and limited to the startup skill catalog.
@@ -354,7 +383,7 @@ Before any tool executes, the agent applies a permission gate:
 2. soft-risk rules request approval for `bash`, `write_file`, and `edit_file`;
 3. CLI approval asks for `y/N` in an interactive terminal, and denies by default when non-interactive.
 
-`todo_write`, `load_skill`, `subagent`, task tools, scheduler tools, team tools, `read_file`, and `glob` are allowed by default. Task tools only write controlled `.tasks` JSON, not arbitrary files. A child subagent's or teammate's `bash` calls still pass through the same approval hook.
+`todo_write`, `load_skill`, `subagent`, task tools, scheduler tools, team tools, `read_file`, and `glob` are allowed by default. Task tools only write controlled `.tasks` JSON, not arbitrary files. Tools whose names start with `mcp__` always require user approval because they execute in external server processes. A child subagent's or teammate's `bash` calls still pass through the same approval hook.
 
 Example tool arguments:
 

@@ -10,9 +10,9 @@ Status / Why / Current implementation / Next
 
 ## Current Focus
 
-- 当前阶段：命令行可用的 OpenAI-compatible agent，具备 chat 进程内 agent team、多 Agent task system、运行时 system prompt assembly、error recovery、安全 realtime trace、chat 进程内 cron scheduler、chat 进程内 background tasks、长期 persistent memory、进程内 conversation session、上下文压缩、原生 tool calling、todo planning、subagent 上下文隔离、按需 skill 加载、本地五工具、hook registry 和执行前权限闸门。
-- 当前重点：把 agent team 通信、task graph、prompt 生成、错误恢复、运行态可观测、定时自动交付、慢操作后台化、长期记忆、干净会话续接、任务规划、上下文隔离、按需上下文加载、工具执行、安全审批、hook 扩展和 provider 扩展沉淀成稳定工程边界。
-- Last updated: 2026-07-02
+- 当前阶段：命令行可用的 OpenAI-compatible agent，具备 stdio MCP tools、chat 进程内 agent team、多 Agent task system、运行时 system prompt assembly、error recovery、安全 realtime trace、chat 进程内 cron scheduler、chat 进程内 background tasks、长期 persistent memory、进程内 conversation session、上下文压缩、原生 tool calling、todo planning、subagent 上下文隔离、按需 skill 加载、本地五工具、hook registry 和执行前权限闸门。
+- 当前重点：把 MCP 外部工具接入、agent team 通信、task graph、prompt 生成、错误恢复、运行态可观测、定时自动交付、慢操作后台化、长期记忆、干净会话续接、任务规划、上下文隔离、按需上下文加载、工具执行、安全审批、hook 扩展和 provider 扩展沉淀成稳定工程边界。
+- Last updated: 2026-07-06
 
 ## Decision Log
 
@@ -42,6 +42,7 @@ Status / Why / Current implementation / Next
 | 2026-07-01 | `agent chat` 增加进程内 cron scheduler，调度管理先作为普通工具，durable 定义写 `.scheduled_tasks.json` | 让 agent 可以在空闲时自动处理定时任务，同时保持无人值守权限默认拒绝和本机私有持久化 |
 | 2026-07-02 | 新增 `.tasks/{id}.json` task system，默认可提交，owner 来自 `--agent-name`，subagent 只读 | 为多 Agent 分工提供可恢复任务图，同时避免调查型 subagent 直接改写项目队列 |
 | 2026-07-02 | `agent chat` 增加进程内 agent team，队友通过 `.teams/{teamId}/inboxes/*.jsonl` 通信，Lead 自动消费 inbox | 用持久队友上下文承担并行协作，同时保持当前进程生命周期、文件邮箱和人工审批边界清晰 |
+| 2026-07-06 | 新增 `agent-mcp` stdio MCP client，main/Lead 将远程 MCP tools 适配为 `mcp__server__tool`，所有 MCP 调用默认审批 | 用标准 MCP 扩展外部工具生态，同时不信任外部 server 注解、不把 MCP 暴露给 subagent/teammate |
 
 ## Stage 1: Project Shape
 
@@ -54,6 +55,7 @@ Status / Why / Current implementation / Next
 
 - `agent-api`: 公共 SDK 契约。
 - `agent-core`: agent loop、mock model、工具注册、本地工具、权限闸门。
+- `agent-mcp`: stdio MCP client，把外部 MCP server 的 tools 适配为本地 `Tool`。
 - `agent-provider-openai-compatible`: OpenAI-compatible Chat Completions provider。
 - `agent-cli`: picocli 命令行入口。
 - 根 `pom.xml` 统一 Java 17、JUnit、AssertJ、Jackson、SLF4J、picocli、logback 和 Maven 插件版本。
@@ -158,7 +160,9 @@ return incompleteResult;
 - 支持 `--provider echo|openai-compatible`。
 - 支持 `--model`，并 fallback 到 `OPENAI_MODEL`。
 - 支持 `--system`。
+- 默认检查项目根 `.mcp.json` 并注册 stdio MCP tools；可用 `--no-mcp` 禁用，或 `--mcp-config <path>` 指向 workspace 内的替代配置。
 - 新增 `agent chat`，支持进程内多轮会话。
+- `agent run` 每次命令启动 MCP server 并在退出前关闭；`agent chat` 启动时连接一次，贯穿整个 chat session，`/clear` 不重载 MCP 配置。
 - `agent chat` 复用进程内 `BackgroundTaskManager`，可让慢 `bash` 后台运行；`/clear` 不取消后台任务。
 - `agent chat` 启动进程内 cron scheduler 和 queue processor；`/clear` 不清 scheduled jobs，不重载 durable 文件。
 - `agent chat` 启动进程内 team runtime 和 Lead inbox poller；`/clear` 不停止 teammates。
@@ -244,9 +248,10 @@ registry.tools()
 - `defaultToolsWithSubagent(...)` 在运行时额外注册 `subagent`，用于 CLI 默认装配。
 - `agent chat` 的 runtime registry 额外注册 scheduler tools：`schedule_task/list_scheduled_tasks/cancel_scheduled_task`。
 - `agent chat` 的 runtime registry 额外注册 team tools：`spawn_teammate/send_message/list_teammates`。
+- main/Lead runtime registry 在本地工具后追加 `.mcp.json` 发现的 MCP tools，命名为 `mcp__{serverName}__{toolName}`。
 - `agent run` 不注册 scheduler/team tools，也不启动 scheduler/team runtime。
-- `teammateTools(...)` 给队友使用，只包含 `send_message`、task system 工具、本地五工具；不包含 `spawn_teammate`、`list_teammates`、`subagent` 或 scheduler tools。
-- `investigationTools()` 给子 agent 使用，只包含 `todo_write`、可选 `load_skill`、只读 task 工具、`read_file/glob/bash`。
+- `teammateTools(...)` 给队友使用，只包含 `send_message`、task system 工具、本地五工具；不包含 `spawn_teammate`、`list_teammates`、`subagent`、scheduler tools 或 MCP tools。
+- `investigationTools()` 给子 agent 使用，只包含 `todo_write`、可选 `load_skill`、只读 task 工具、`read_file/glob/bash`，不包含 MCP tools。
 - duplicate tool name fail fast。
 - `DefaultAgent` 使用 registry 查找工具。
 - CLI 只依赖 registry，不直接知道默认工具类。
@@ -344,7 +349,8 @@ hard deny -> soft rule -> user approval -> execute
 
 - 永远拒绝：工作区外路径、symlink 逃逸、`sudo`、`su`、`shutdown`、`reboot`、`halt`、`mkfs`、`dd`、`rm -rf /`。
 - 默认放行：`todo_write`、`load_skill`、`subagent`、task system 工具、`schedule_task`、`list_scheduled_tasks`、`cancel_scheduled_task`、team 通信/管理工具、`read_file`、`glob`。
-- 默认询问：`bash`、`write_file`、`edit_file`。
+- 默认询问：`bash`、`write_file`、`edit_file`、所有 `mcp__...` 工具。
+- MCP approval 的 risk summary 包含 server/tool 和参数摘要；不信任 MCP annotations 自动放行。
 
 **Next:**
 
@@ -513,11 +519,12 @@ system prompt 不能继续由 `AgentRequest` 默认值、多个 `UserPromptSubmi
 
 - `PromptAssemblyHook` 是默认第一个 `USER_PROMPT_SUBMIT` hook。
 - `PromptAssembler` 用 Java `PromptSection` 组装 system prompt，并缓存相同签名的结果。
-- section 顺序固定：`identity`、`model_identity`、`user_instructions`、`workspace`、`tools`、`task_system`、`team_system`、`persistent_memory_index`、`skill_catalog`、`todo_planning`、`session_memory`、`subagent_expected_output`。
+- section 顺序固定：`identity`、`model_identity`、`user_instructions`、`workspace`、`tools`、`mcp_tools`、`task_system`、`team_system`、`persistent_memory_index`、`skill_catalog`、`todo_planning`、`session_memory`、`subagent_expected_output`。
 - `AgentRequest.systemPrompt` 保持 API 兼容，但语义变成用户附加指令；默认 identity 不再放在 `AgentRequest`。
 - `model_identity` 来自 request metadata，由 CLI 注入 provider/model/base URL；不包含 API key。
 - 当用户询问模型身份时，agent 应回答自己是本地 Java agent runtime，使用当前配置的 provider/model，而不是自称 Claude、Anthropic 或其他未在运行时配置中出现的身份。
 - provider 不再单独追加 `AgentMemory`；它只发送已组装的 system prompt。
+- `mcp_tools` 只在 enabled tools 中存在 `mcp__...` 工具时生成，说明这些工具来自外部 server 且调用前需要用户审批。
 - relevant long-term memory 全文继续注入当前 user turn，不进入 system prompt，保持稳定 sections 更容易被 provider prompt cache 命中。
 - subagent 使用 `SUBAGENT` prompt mode，只继承用户附加指令，不继承父 agent 的完整 system prompt。
 - teammate 使用 `TEAMMATE` prompt mode，获得队友身份、inbox 通信规则和不能递归 spawn 的约束。
@@ -727,7 +734,39 @@ system prompt 不能继续由 `AgentRequest` 默认值、多个 `UserPromptSubmi
 - 如果要跨进程恢复 team，需要先把 `.teams/` 从 runtime mailbox 升级为可恢复状态，并处理坏消息、重复投递和队友进程重启。
 - 如果要支持 teammate-to-teammate topology、broadcast 或 plan approval，需要先扩展 `TeamMessageType` 和权限模型。
 
-## Stage 25: Testing and Verification
+## Stage 25: MCP Tools / External Tool Bridge
+
+**Status:** Done for v1, stdio-only.
+
+**Why:**  
+本地工具无法覆盖所有生态。MCP 是外部工具扩展的标准入口，但 MCP server 是独立进程，输出和 schema 都不应被默认信任。v1 的目标是把 `tools/list` 发现的远程工具接入现有 `ToolRegistry` 和权限闸门，而不是把 agent 变成完整 MCP platform。
+
+**Current implementation:**
+
+- 新模块：`agent-mcp`。
+- 配置来源：workspace 内 `.mcp.json`，或 CLI `--mcp-config <path>` 指定的 workspace 内文件。
+- 支持 Claude 风格配置：`mcpServers.{server}.command/args/env`。
+- `.mcp.json` 不存在时正常启动，不注册 MCP tools。
+- `.mcp.json` 存在但 JSON 非法、server name 非法或 command 为空时 fail fast。
+- server name 和 remote tool name 都要求稳定字符；注册名为 `mcp__{serverName}__{toolName}`。
+- transport 只支持 stdio：启动子进程后执行 `initialize -> notifications/initialized -> tools/list`，并支持 `nextCursor` 分页。
+- tool 调用走 `tools/call`，默认 60 秒超时；协议错误、超时、进程退出、malformed JSON 转成清晰工具错误。
+- MCP `inputSchema` 映射到当前 `Tool.parametersSchema()`。
+- MCP `content`、`structuredContent`、`isError` 转成 `ToolResult` 字符串输出，复用 20,000 字符截断策略。
+- `agent run` 每次启动 MCP server，命令结束后关闭。
+- `agent chat` 启动时连接一次并贯穿整个 session；`/clear` 不重载 `.mcp.json`。
+- MCP tools 只暴露给 main/Lead；subagent 和 teammate 暂不可见。
+- `DefaultPermissionChecker` 对所有 `mcp__...` 工具返回 `ASK_USER`，cron synthetic turn 中仍按非交互审批默认拒绝。
+- Prompt assembly 在 MCP 工具存在时生成 `mcp_tools` section。
+
+**Next:**
+
+- 支持 per-server/per-tool allowlist 前，需要先设计可审计 policy，不直接信任 MCP annotations。
+- 如果要支持 Streamable HTTP/OAuth/remote MCP server，需要新增 transport 层和更明确的网络权限模型。
+- 后续可评估 resources/prompts/sampling/elicitation，但不要混入 v1 工具调用路径。
+- 增加 MCP server stderr debug 输出时必须避免把日志注入模型上下文。
+
+## Stage 26: Testing and Verification
 
 **Status:** Done, expanded with each capability.
 
@@ -739,7 +778,8 @@ system prompt 不能继续由 `AgentRequest` 默认值、多个 `UserPromptSubmi
 - `agent-api`: record 行为、metadata/system prompt、conversation history、model options、notifications、recovery events、trace events、结构化工具参数。
 - `agent-core`: loop、agent team/message bus、task system、runtime trace、cron scheduler、background tasks、error recovery、session、context compression、persistent memory、prompt assembly、max steps、tool call id、工具失败回传、hook registry、权限闸门、registry duplicate、subagent 上下文隔离。
 - `agent-provider-openai-compatible`: fake HTTP client 覆盖 final answer、tool call、task notification、conversation message order、`max_tokens`、HTTP/typed error 映射、JSON 解析失败、缺少 API key。
-- `agent-cli`: 默认 echo、provider 参数校验、`OPENAI_MODEL` fallback、trace stdout/stderr 分流、team chat/run 差异、cron chat/run 差异、background chat/run 差异、error recovery 参数、`agent chat`、交互式审批和非交互默认拒绝。
+- `agent-mcp`: 配置解析、stdio JSON-RPC initialize/list/call、分页、tool adapter、`isError`、协议错误、malformed JSON、超时/进程退出。
+- `agent-cli`: 默认 echo、provider 参数校验、MCP config/禁用/生命周期、`OPENAI_MODEL` fallback、trace stdout/stderr 分流、team chat/run 差异、cron chat/run 差异、background chat/run 差异、error recovery 参数、`agent chat`、交互式审批和非交互默认拒绝。
 - local tools: task create/list/get/can_start/claim/complete、workspace 内读写改查、越界拒绝、symlink 逃逸、bash exit code/timeout/危险命令。
 
 **Verification commands:**
@@ -777,5 +817,6 @@ java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar run "hello local tools"
 - 每次修改 cron 表达式语义、scheduler 生命周期、durable 存储或 cron 权限边界，都同步更新 `Stage 22: Cron Scheduler`。
 - 每次修改 task schema、owner/claim 语义、依赖规则或 `.tasks` 持久化策略，都同步更新 `Stage 23: Task System / Multi-Agent Coordination`。
 - 每次修改 team message schema、inbox 路径、teammate 生命周期、team 工具或 teammate 权限边界，都同步更新 `Stage 24: Agent Team / Persistent Teammates`。
+- 每次修改 MCP config、transport、tool name 映射、tool result 转换或 MCP 权限策略，都同步更新 `Stage 25: MCP Tools / External Tool Bridge`。
 - 每次新增 provider，都同步更新 `Stage 6` 或新增 provider stage。
 - 文档可以记录未完成事项，但不要把它改成零散 changelog；能力递进主线必须保留。

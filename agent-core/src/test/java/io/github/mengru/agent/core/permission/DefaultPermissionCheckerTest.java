@@ -70,6 +70,17 @@ class DefaultPermissionCheckerTest {
     }
 
     @Test
+    void mcpToolsAlwaysRequireUserApproval() {
+        DefaultPermissionChecker checker = new DefaultPermissionChecker(workspace);
+
+        PermissionDecision decision = checker.check(request("mcp__demo__echo", args().put("text", "hello")));
+
+        assertThat(decision.outcome()).isEqualTo(PermissionDecision.Outcome.ASK_USER);
+        assertThat(decision.reason()).contains("external server process");
+        assertThat(decision.riskSummary()).contains("server=demo, tool=echo");
+    }
+
+    @Test
     void hardDeniesWorkspaceEscapeBeforeAsking() {
         DefaultPermissionChecker checker = new DefaultPermissionChecker(workspace);
 

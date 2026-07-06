@@ -39,12 +39,16 @@ public final class TeamRuntime implements AutoCloseable {
     public static final String TEAM_ID_METADATA_KEY = "agent.team.id";
     public static final String TEAM_ROLE_METADATA_KEY = "agent.team.role";
     public static final String TEAM_LEAD_METADATA_KEY = "agent.team.lead";
+    public static final String PERMISSION_REVIEWER_METADATA_KEY = "agent.permission.reviewer";
+    public static final String PERMISSION_REVIEW_OUTCOME_METADATA_KEY = "agent.permission.review.outcome";
+    public static final String PERMISSION_REVIEW_REASON_METADATA_KEY = "agent.permission.review.reason";
 
     private final String teamId;
     private final String leadName;
     private final MessageBus bus;
     private final ModelClient modelClient;
     private final UserApprover humanApprover;
+    private final TeamPermissionReviewer teamPermissionReviewer;
     private final SkillCatalog skillCatalog;
     private final MemoryCatalog memoryCatalog;
     private final TaskManager taskManager;
@@ -67,11 +71,40 @@ public final class TeamRuntime implements AutoCloseable {
             String userInstructions,
             Map<String, String> baseMetadata
     ) {
+        this(
+                workspace,
+                leadName,
+                modelClient,
+                humanApprover,
+                skillCatalog,
+                memoryCatalog,
+                taskManager,
+                modelOptions,
+                userInstructions,
+                baseMetadata,
+                new DefaultTeamPermissionReviewer()
+        );
+    }
+
+    public TeamRuntime(
+            Path workspace,
+            String leadName,
+            ModelClient modelClient,
+            UserApprover humanApprover,
+            SkillCatalog skillCatalog,
+            MemoryCatalog memoryCatalog,
+            TaskManager taskManager,
+            ModelOptions modelOptions,
+            String userInstructions,
+            Map<String, String> baseMetadata,
+            TeamPermissionReviewer teamPermissionReviewer
+    ) {
         this.teamId = "team_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         this.leadName = MessageBus.validateAgentName(leadName == null || leadName.isBlank() ? "main" : leadName);
         this.bus = new MessageBus(workspace, teamId);
         this.modelClient = Objects.requireNonNull(modelClient, "modelClient must not be null");
         this.humanApprover = Objects.requireNonNull(humanApprover, "humanApprover must not be null");
+        this.teamPermissionReviewer = Objects.requireNonNull(teamPermissionReviewer, "teamPermissionReviewer must not be null");
         this.skillCatalog = Objects.requireNonNull(skillCatalog, "skillCatalog must not be null");
         this.memoryCatalog = Objects.requireNonNull(memoryCatalog, "memoryCatalog must not be null");
         this.taskManager = Objects.requireNonNull(taskManager, "taskManager must not be null");
@@ -203,16 +236,28 @@ public final class TeamRuntime implements AutoCloseable {
                 correlationId,
                 payload
         );
-        boolean approved = humanApprover.approve(request, decision);
+        TeamPermissionReviewDecision review = reviewPermission(teammateName, worker != null, request, decision);
+        boolean approved = false;
+        String responseContent;
+        if (review.outcome() == TeamPermissionReviewDecision.Outcome.ESCALATE_TO_USER) {
+            approved = humanApprover.approve(withReviewMetadata(request, review), decision);
+            responseContent = approved
+                    ? "human approved teammate permission request after Lead review"
+                    : "human rejected teammate permission request after Lead review";
+        } else {
+            responseContent = "Lead rejected teammate permission request: " + review.reason();
+        }
         ObjectNode responsePayload = JsonNodeFactory.instance.objectNode();
         responsePayload.put("approved", approved);
         responsePayload.put("toolCallId", request.toolCallId());
         responsePayload.put("toolName", request.toolName());
+        responsePayload.put("reviewOutcome", review.outcome().name().toLowerCase(java.util.Locale.ROOT));
+        responsePayload.put("reviewReason", review.reason());
         sendInternal(
                 TeamMessageType.PERMISSION_RESPONSE,
                 leadName,
                 teammateName,
-                approved ? "human approved teammate permission request" : "human rejected teammate permission request",
+                responseContent,
                 correlationId,
                 responsePayload
         );
@@ -223,6 +268,27 @@ public final class TeamRuntime implements AutoCloseable {
             );
         }
         return approved;
+    }
+
+    private TeamPermissionReviewDecision reviewPermission(
+            String teammateName,
+            boolean knownTeammate,
+            PermissionRequest request,
+            PermissionDecision decision
+    ) {
+        try {
+            return teamPermissionReviewer.review(new TeamPermissionReviewRequest(teammateName, knownTeammate, request, decision));
+        } catch (RuntimeException e) {
+            return TeamPermissionReviewDecision.deny("Lead permission review failed: " + e.getMessage());
+        }
+    }
+
+    private PermissionRequest withReviewMetadata(PermissionRequest request, TeamPermissionReviewDecision review) {
+        LinkedHashMap<String, String> metadata = new LinkedHashMap<>(request.metadata());
+        metadata.put(PERMISSION_REVIEWER_METADATA_KEY, leadName);
+        metadata.put(PERMISSION_REVIEW_OUTCOME_METADATA_KEY, review.outcome().name().toLowerCase(java.util.Locale.ROOT));
+        metadata.put(PERMISSION_REVIEW_REASON_METADATA_KEY, review.reason());
+        return new PermissionRequest(request.toolCallId(), request.toolName(), request.arguments(), metadata);
     }
 
     private TeamMessage sendInternal(TeamMessageType type, String from, String to, String content, String correlationId, JsonNode payload) {

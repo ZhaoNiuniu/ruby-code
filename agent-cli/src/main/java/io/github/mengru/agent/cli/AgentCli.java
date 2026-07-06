@@ -4,6 +4,7 @@ import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.ModelClient;
 import io.github.mengru.agent.api.ModelOptions;
+import io.github.mengru.agent.api.Tool;
 import io.github.mengru.agent.core.AgentSession;
 import io.github.mengru.agent.core.background.BackgroundTaskManager;
 import io.github.mengru.agent.core.DefaultAgent;
@@ -34,6 +35,9 @@ import io.github.mengru.agent.core.team.TeamMessage;
 import io.github.mengru.agent.core.team.TeamRuntime;
 import io.github.mengru.agent.core.tool.ToolRegistry;
 import io.github.mengru.agent.core.trace.TraceSink;
+import io.github.mengru.agent.mcp.McpConfig;
+import io.github.mengru.agent.mcp.McpException;
+import io.github.mengru.agent.mcp.McpToolProvider;
 import io.github.mengru.agent.provider.openai.OpenAiCompatibleException;
 import io.github.mengru.agent.provider.openai.OpenAiCompatibleModelClient;
 import picocli.CommandLine;
@@ -51,6 +55,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.LinkedHashMap;
@@ -184,13 +189,32 @@ public final class AgentCli implements Callable<Integer> {
                 spec.commandLine().getErr().println(style.trace(event));
                 spec.commandLine().getErr().flush();
             } finally {
-                chatConsole.afterAsyncOutput();
+                chatConsole.afterAsyncOutput(false);
             }
         };
     }
 
     private static boolean isCronTriggered(PermissionRequest request) {
         return "cron".equals(request.metadata().get("agent.trigger"));
+    }
+
+    private static McpToolProvider createMcpToolProvider(boolean noMcp, Path mcpConfigPath) {
+        if (noMcp) {
+            return McpToolProvider.empty();
+        }
+        McpConfig config = mcpConfigPath == null
+                ? McpConfig.loadDefault(Path.of(""))
+                : McpConfig.load(Path.of(""), mcpConfigPath);
+        return McpToolProvider.start(config);
+    }
+
+    private static ToolRegistry withMcpTools(ToolRegistry baseRegistry, McpToolProvider mcpToolProvider) {
+        if (mcpToolProvider.isEmpty()) {
+            return baseRegistry;
+        }
+        ArrayList<Tool> tools = new ArrayList<>(baseRegistry.tools());
+        tools.addAll(mcpToolProvider.tools());
+        return ToolRegistry.of(tools);
     }
 
     @Command(name = "run", description = "Runs a task through the default echo agent.")
@@ -271,6 +295,12 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--color", defaultValue = "auto", description = "Color output: auto, always, never.")
         private String color;
 
+        @Option(names = "--no-mcp", description = "Disable project MCP tools from .mcp.json.")
+        private boolean noMcp;
+
+        @Option(names = "--mcp-config", description = "MCP config path inside the workspace. Defaults to .mcp.json.")
+        private Path mcpConfig;
+
         @Parameters(arity = "0..*", paramLabel = "TASK", description = "Task for the agent to run.")
         private List<String> taskParts;
 
@@ -289,9 +319,10 @@ public final class AgentCli implements Callable<Integer> {
                 return CommandLine.ExitCode.USAGE;
             }
 
-            DefaultAgent agent;
-            ModelOptions modelOptions;
-            try {
+            AgentResult result;
+            try (McpToolProvider mcpToolProvider = createMcpToolProvider(noMcp, mcpConfig)) {
+                DefaultAgent agent;
+                ModelOptions modelOptions;
                 modelOptions = createModelOptions();
                 ModelClient modelClient = createModelClient();
                 BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.disabled();
@@ -300,7 +331,10 @@ public final class AgentCli implements Callable<Integer> {
                 MemoryStore memoryStore = MemoryStore.defaultStore();
                 MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
                 printMemoryWarnings(memoryCatalog, terminalStyle);
-                ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, memoryCatalog);
+                ToolRegistry toolRegistry = withMcpTools(
+                        ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, memoryCatalog),
+                        mcpToolProvider
+                );
                 agent = new DefaultAgent(
                         modelClient,
                         toolRegistry,
@@ -310,19 +344,12 @@ public final class AgentCli implements Callable<Integer> {
                         backgroundTaskManager,
                         trace ? stderrTraceSink(spec, terminalStyle) : TraceSink.noop()
                 );
-            } catch (IllegalArgumentException | OpenAiCompatibleException e) {
+                AgentRequest request = new AgentRequest(task, maxSteps, requestMetadata(), systemPrompt)
+                        .withModelOptions(modelOptions);
+                result = agent.run(request);
+            } catch (IllegalArgumentException | OpenAiCompatibleException | McpException e) {
                 spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
                 return CommandLine.ExitCode.USAGE;
-            }
-
-            AgentRequest request = new AgentRequest(task, maxSteps, requestMetadata(), systemPrompt)
-                    .withModelOptions(modelOptions);
-            AgentResult result;
-            try {
-                result = agent.run(request);
-            } catch (OpenAiCompatibleException e) {
-                spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
-                return CommandLine.ExitCode.SOFTWARE;
             }
 
             spec.commandLine().getOut().println(result.output());
@@ -563,6 +590,12 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--color", defaultValue = "auto", description = "Color output: auto, always, never.")
         private String color;
 
+        @Option(names = "--no-mcp", description = "Disable project MCP tools from .mcp.json.")
+        private boolean noMcp;
+
+        @Option(names = "--mcp-config", description = "MCP config path inside the workspace. Defaults to .mcp.json.")
+        private Path mcpConfig;
+
         @Override
         public Integer call() throws IOException {
             TerminalStyle terminalStyle;
@@ -572,7 +605,10 @@ public final class AgentCli implements Callable<Integer> {
                 spec.commandLine().getErr().println(e.getMessage());
                 return CommandLine.ExitCode.USAGE;
             }
-            try (ChatConsole chatConsole = new ChatConsole(inputReader, spec.commandLine().getErr(), interactiveApproval, terminalStyle)) {
+            try (
+                    ChatConsole chatConsole = new ChatConsole(inputReader, spec.commandLine().getErr(), interactiveApproval, terminalStyle);
+                    McpToolProvider mcpToolProvider = createMcpToolProvider(noMcp, mcpConfig)
+            ) {
                 chatConsole.start();
                 AgentSession session;
                 ModelOptions modelOptions;
@@ -604,14 +640,17 @@ public final class AgentCli implements Callable<Integer> {
                         systemPrompt,
                         requestMetadata()
                 );
-                ToolRegistry toolRegistry = ToolRegistry.defaultToolsWithSubagent(
-                        modelClient,
-                        userApprover,
-                        skillCatalog,
-                        memoryCatalog,
-                        scheduledTaskManager,
-                        taskManager,
-                        teamRuntime
+                ToolRegistry toolRegistry = withMcpTools(
+                        ToolRegistry.defaultToolsWithSubagent(
+                                modelClient,
+                                userApprover,
+                                skillCatalog,
+                                memoryCatalog,
+                                scheduledTaskManager,
+                                taskManager,
+                                teamRuntime
+                        ),
+                        mcpToolProvider
                 );
                 session = new AgentSession(new DefaultAgent(
                         modelClient,
@@ -692,6 +731,7 @@ public final class AgentCli implements Callable<Integer> {
                             lastExitCode = CommandLine.ExitCode.SOFTWARE;
                             continue;
                         }
+                        chatConsole.waitForNoActiveApproval();
                         spec.commandLine().getOut().println(terminalStyle.assistantPrefix() + " " + result.output());
                         lastExitCode = result.completed() ? 0 : 2;
                     }
@@ -701,7 +741,7 @@ public final class AgentCli implements Callable<Integer> {
                     cronQueueProcessor.close();
                     cronScheduler.close();
                 }
-            } catch (IllegalArgumentException | OpenAiCompatibleException e) {
+            } catch (IllegalArgumentException | OpenAiCompatibleException | McpException e) {
                 spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
                 return CommandLine.ExitCode.USAGE;
             } catch (InterruptedException e) {
@@ -941,7 +981,7 @@ public final class AgentCli implements Callable<Integer> {
                 return;
             }
             synchronized (err) {
-                if (promptVisible) {
+                if (promptVisible || activeApproval != null) {
                     return;
                 }
                 err.print(terminalStyle.prompt("chat> "));
@@ -977,11 +1017,15 @@ public final class AgentCli implements Callable<Integer> {
         }
 
         void afterAsyncOutput() {
+            afterAsyncOutput(true);
+        }
+
+        void afterAsyncOutput(boolean repaintPrompt) {
             if (!interactive || !waitingForInput) {
                 return;
             }
             synchronized (err) {
-                if (!promptVisible) {
+                if (repaintPrompt && !promptVisible && activeApproval == null) {
                     err.print(terminalStyle.prompt("chat> "));
                     err.flush();
                     promptVisible = true;
@@ -991,6 +1035,14 @@ public final class AgentCli implements Callable<Integer> {
 
         boolean isWaitingForInput() {
             return waitingForInput;
+        }
+
+        void waitForNoActiveApproval() throws InterruptedException {
+            synchronized (approvalLock) {
+                while (activeApproval != null && !closed) {
+                    approvalLock.wait();
+                }
+            }
         }
 
         boolean approve(PermissionRequest request, io.github.mengru.agent.core.permission.PermissionDecision decision) {
@@ -1054,6 +1106,7 @@ public final class AgentCli implements Callable<Integer> {
             PermissionRequest request = approval.request();
             io.github.mengru.agent.core.permission.PermissionDecision decision = approval.decision();
             synchronized (err) {
+                promptVisible = false;
                 err.println(terminalStyle.warning("Tool approval required:"));
                 if (!request.metadata().getOrDefault("agent.name", "").isBlank()) {
                     err.println("  requester: " + request.metadata().get("agent.name"));
@@ -1063,6 +1116,12 @@ public final class AgentCli implements Callable<Integer> {
                 }
                 if (!request.metadata().getOrDefault("agent.team.role", "").isBlank()) {
                     err.println("  team role: " + request.metadata().get("agent.team.role"));
+                }
+                if (!request.metadata().getOrDefault("agent.permission.reviewer", "").isBlank()) {
+                    err.println("  reviewed by: " + request.metadata().get("agent.permission.reviewer"));
+                }
+                if (!request.metadata().getOrDefault("agent.permission.review.reason", "").isBlank()) {
+                    err.println("  review: " + request.metadata().get("agent.permission.review.reason"));
                 }
                 err.println("  tool: " + request.toolName());
                 err.println("  reason: " + decision.reason());

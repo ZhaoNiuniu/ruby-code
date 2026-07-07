@@ -30,6 +30,11 @@
         </dependency>
         <dependency>
             <groupId>io.github.mengru.agent</groupId>
+            <artifactId>agent-runtime</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.mengru.agent</groupId>
             <artifactId>agent-provider-openai-compatible</artifactId>
             <version>${project.version}</version>
         </dependency>

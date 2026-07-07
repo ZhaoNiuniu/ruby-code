@@ -1,5 +1,6 @@
 package io.github.mengru.agent.cli;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.ModelClient;
@@ -17,6 +18,7 @@ import io.github.mengru.agent.core.memory.MemoryDefinition;
 import io.github.mengru.agent.core.memory.MemoryExtractor;
 import io.github.mengru.agent.core.memory.MemoryStore;
 import io.github.mengru.agent.core.permission.PermissionRequest;
+import io.github.mengru.agent.core.permission.PermissionChecker;
 import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.prompt.PromptAssembler;
 import io.github.mengru.agent.core.recovery.ErrorRecoveryConfig;
@@ -40,6 +42,13 @@ import io.github.mengru.agent.mcp.McpException;
 import io.github.mengru.agent.mcp.McpToolProvider;
 import io.github.mengru.agent.provider.openai.OpenAiCompatibleException;
 import io.github.mengru.agent.provider.openai.OpenAiCompatibleModelClient;
+import io.github.mengru.agent.runtime.PolicyPermissionChecker;
+import io.github.mengru.agent.runtime.RuntimeProfileException;
+import io.github.mengru.agent.runtime.RuntimeProfileOverrides;
+import io.github.mengru.agent.runtime.RuntimeProfileResolution;
+import io.github.mengru.agent.runtime.RuntimeProfileResolver;
+import io.github.mengru.agent.runtime.RuntimeSettings;
+import io.github.mengru.agent.runtime.RuntimeToolFilter;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
@@ -76,6 +85,9 @@ import java.util.concurrent.LinkedBlockingQueue;
 )
 public final class AgentCli implements Callable<Integer> {
 
+    private static final Path WORKSPACE_ROOT = Path.of("");
+    private static final ObjectMapper JSON = new ObjectMapper();
+
     @Spec
     private CommandSpec spec;
 
@@ -105,6 +117,9 @@ public final class AgentCli implements Callable<Integer> {
         commandLine.addSubcommand("run", new RunCommand(environment, inputStream, interactiveApproval));
         commandLine.addSubcommand("chat", new ChatCommand(environment, inputStream, interactiveApproval));
         commandLine.addSubcommand("memory", new MemoryCommand());
+        CommandLine profile = new CommandLine(new ProfileCommand());
+        profile.addSubcommand("show", new ProfileShowCommand(environment));
+        commandLine.addSubcommand("profile", profile);
         return commandLine;
     }
 
@@ -118,6 +133,9 @@ public final class AgentCli implements Callable<Integer> {
         commandLine.addSubcommand("run", new RunCommand(environment, inputStream, interactiveApproval, fixedModelClient));
         commandLine.addSubcommand("chat", new ChatCommand(environment, inputStream, interactiveApproval, fixedModelClient));
         commandLine.addSubcommand("memory", new MemoryCommand());
+        CommandLine profile = new CommandLine(new ProfileCommand());
+        profile.addSubcommand("show", new ProfileShowCommand(environment));
+        commandLine.addSubcommand("profile", profile);
         return commandLine;
     }
 
@@ -138,12 +156,7 @@ public final class AgentCli implements Callable<Integer> {
         return memoryCatalog;
     }
 
-    private static Map<String, String> modelIdentityMetadata(
-            String provider,
-            String cliModel,
-            Map<String, String> environment,
-            boolean fixedModelClient
-    ) {
+    private static Map<String, String> modelIdentityMetadata(RuntimeSettings settings, boolean fixedModelClient) {
         LinkedHashMap<String, String> metadata = new LinkedHashMap<>();
         if (fixedModelClient) {
             metadata.put(PromptAssembler.PROVIDER_METADATA_KEY, "fixed-test-client");
@@ -151,28 +164,16 @@ public final class AgentCli implements Callable<Integer> {
             return metadata;
         }
 
-        String resolvedProvider = provider == null || provider.isBlank() ? "echo" : provider.strip();
-        metadata.put(PromptAssembler.PROVIDER_METADATA_KEY, resolvedProvider);
-        if ("openai-compatible".equals(resolvedProvider)) {
-            String resolvedModel = firstNonBlank(cliModel, environment.get("OPENAI_MODEL"));
-            String resolvedBaseUrl = firstNonBlank(environment.get("OPENAI_BASE_URL"), OpenAiCompatibleModelClient.DEFAULT_BASE_URL);
-            if (resolvedModel != null) {
-                metadata.put(PromptAssembler.MODEL_METADATA_KEY, resolvedModel);
+        metadata.put(PromptAssembler.PROVIDER_METADATA_KEY, settings.provider());
+        if ("openai-compatible".equals(settings.provider())) {
+            if (settings.model() != null) {
+                metadata.put(PromptAssembler.MODEL_METADATA_KEY, settings.model());
             }
-            metadata.put(PromptAssembler.BASE_URL_METADATA_KEY, resolvedBaseUrl);
-        } else if ("echo".equals(resolvedProvider)) {
+            metadata.put(PromptAssembler.BASE_URL_METADATA_KEY, settings.baseUrl());
+        } else if ("echo".equals(settings.provider())) {
             metadata.put(PromptAssembler.MODEL_METADATA_KEY, "echo");
         }
         return Map.copyOf(metadata);
-    }
-
-    private static String firstNonBlank(String... values) {
-        for (String value : values) {
-            if (value != null && !value.isBlank()) {
-                return value.strip();
-            }
-        }
-        return null;
     }
 
     private static TraceSink stderrTraceSink(CommandSpec spec, TerminalStyle style) {
@@ -198,14 +199,34 @@ public final class AgentCli implements Callable<Integer> {
         return "cron".equals(request.metadata().get("agent.trigger"));
     }
 
-    private static McpToolProvider createMcpToolProvider(boolean noMcp, Path mcpConfigPath) {
-        if (noMcp) {
+    private static McpToolProvider createMcpToolProvider(RuntimeSettings settings) {
+        if (!settings.mcpTools()) {
             return McpToolProvider.empty();
         }
-        McpConfig config = mcpConfigPath == null
-                ? McpConfig.loadDefault(Path.of(""))
-                : McpConfig.load(Path.of(""), mcpConfigPath);
+        McpConfig config = settings.mcpConfigPath() == null
+                ? McpConfig.loadDefault(WORKSPACE_ROOT)
+                : McpConfig.load(WORKSPACE_ROOT, settings.mcpConfigPath());
         return McpToolProvider.start(config);
+    }
+
+    private static RuntimeProfileResolution resolveRuntimeProfile(
+            String profile,
+            RuntimeProfileOverrides overrides,
+            Map<String, String> environment
+    ) {
+        return new RuntimeProfileResolver().resolve(WORKSPACE_ROOT, profile, overrides, environment);
+    }
+
+    private static ToolRegistry applyRuntimeToolFilter(ToolRegistry registry, RuntimeSettings settings) {
+        return RuntimeToolFilter.filter(registry, settings);
+    }
+
+    private static Map<String, String> openAiEnvironment(RuntimeSettings settings, Map<String, String> environment) {
+        LinkedHashMap<String, String> resolved = new LinkedHashMap<>(environment);
+        if (settings.baseUrl() != null && !settings.baseUrl().isBlank()) {
+            resolved.put("OPENAI_BASE_URL", settings.baseUrl());
+        }
+        return Map.copyOf(resolved);
     }
 
     private static ToolRegistry withMcpTools(ToolRegistry baseRegistry, McpToolProvider mcpToolProvider) {
@@ -253,7 +274,10 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--max-steps", defaultValue = "8", description = "Maximum agent loop steps.")
         private int maxSteps;
 
-        @Option(names = "--provider", defaultValue = "echo", description = "Provider to use: echo, openai-compatible.")
+        @Option(names = "--profile", description = "Runtime profile: dev, readonly, or a project profile in .agent/profiles.")
+        private String profile;
+
+        @Option(names = "--provider", description = "Provider to use: echo, openai-compatible.")
         private String provider;
 
         @Option(names = "--model", description = "Model name for --provider openai-compatible. Defaults to OPENAI_MODEL.")
@@ -268,26 +292,26 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--no-context-compression", description = "Disable context compression for this run.")
         private boolean noContextCompression;
 
-        @Option(names = "--context-window-tokens", defaultValue = "128000", description = "Estimated context window tokens.")
-        private int contextWindowTokens;
+        @Option(names = "--context-window-tokens", description = "Estimated context window tokens.")
+        private Integer contextWindowTokens;
 
-        @Option(names = "--max-output-tokens", defaultValue = "4000", description = "Estimated output budget reserved for context compression.")
-        private int maxOutputTokens;
+        @Option(names = "--max-output-tokens", description = "Estimated output budget reserved for context compression.")
+        private Integer maxOutputTokens;
 
-        @Option(names = "--reserved-tokens", defaultValue = "13000", description = "Estimated reserved tokens for safety margin.")
-        private int reservedTokens;
+        @Option(names = "--reserved-tokens", description = "Estimated reserved tokens for safety margin.")
+        private Integer reservedTokens;
 
         @Option(names = "--no-error-recovery", description = "Disable model-call error recovery.")
         private boolean noErrorRecovery;
 
-        @Option(names = "--model-retry-attempts", defaultValue = "3", description = "Transient model error retry attempts.")
-        private int modelRetryAttempts;
+        @Option(names = "--model-retry-attempts", description = "Transient model error retry attempts.")
+        private Integer modelRetryAttempts;
 
-        @Option(names = "--generation-max-output-tokens", defaultValue = "8192", description = "Generation max output tokens sent to the provider.")
-        private int generationMaxOutputTokens;
+        @Option(names = "--generation-max-output-tokens", description = "Generation max output tokens sent to the provider.")
+        private Integer generationMaxOutputTokens;
 
-        @Option(names = "--recovery-max-output-tokens", defaultValue = "65536", description = "Max output tokens used for output-truncation recovery.")
-        private int recoveryMaxOutputTokens;
+        @Option(names = "--recovery-max-output-tokens", description = "Max output tokens used for output-truncation recovery.")
+        private Integer recoveryMaxOutputTokens;
 
         @Option(names = "--trace", description = "Print safe runtime trace events to stderr.")
         private boolean trace;
@@ -320,34 +344,37 @@ public final class AgentCli implements Callable<Integer> {
             }
 
             AgentResult result;
-            try (McpToolProvider mcpToolProvider = createMcpToolProvider(noMcp, mcpConfig)) {
-                DefaultAgent agent;
-                ModelOptions modelOptions;
-                modelOptions = createModelOptions();
-                ModelClient modelClient = createModelClient();
-                BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.disabled();
-                UserApprover userApprover = createUserApprover(terminalStyle);
-                SkillCatalog skillCatalog = SkillCatalog.scanDefault();
-                MemoryStore memoryStore = MemoryStore.defaultStore();
-                MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
-                printMemoryWarnings(memoryCatalog, terminalStyle);
-                ToolRegistry toolRegistry = withMcpTools(
-                        ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, memoryCatalog),
-                        mcpToolProvider
-                );
-                agent = new DefaultAgent(
-                        modelClient,
-                        toolRegistry,
-                        createHookRegistry(toolRegistry, userApprover, modelClient, memoryStore, memoryCatalog),
-                        createContextManager(),
-                        createErrorRecoveryConfig(),
-                        backgroundTaskManager,
-                        trace ? stderrTraceSink(spec, terminalStyle) : TraceSink.noop()
-                );
-                AgentRequest request = new AgentRequest(task, maxSteps, requestMetadata(), systemPrompt)
-                        .withModelOptions(modelOptions);
-                result = agent.run(request);
-            } catch (IllegalArgumentException | OpenAiCompatibleException | McpException e) {
+            try {
+                RuntimeSettings settings = resolveRuntimeProfile(profile, runtimeOverrides(), environment).settings();
+                try (McpToolProvider mcpToolProvider = createMcpToolProvider(settings)) {
+                    DefaultAgent agent;
+                    ModelOptions modelOptions;
+                    modelOptions = createModelOptions(settings);
+                    ModelClient modelClient = createModelClient(settings);
+                    BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.disabled();
+                    UserApprover userApprover = createUserApprover(terminalStyle);
+                    SkillCatalog skillCatalog = SkillCatalog.scanDefault();
+                    MemoryStore memoryStore = MemoryStore.defaultStore();
+                    MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
+                    printMemoryWarnings(memoryCatalog, terminalStyle);
+                    ToolRegistry toolRegistry = applyRuntimeToolFilter(withMcpTools(
+                            ToolRegistry.defaultToolsWithSubagent(modelClient, userApprover, skillCatalog, memoryCatalog),
+                            mcpToolProvider
+                    ), settings);
+                    agent = new DefaultAgent(
+                            modelClient,
+                            toolRegistry,
+                            createHookRegistry(toolRegistry, userApprover, modelClient, memoryStore, memoryCatalog, settings),
+                            createContextManager(settings),
+                            createErrorRecoveryConfig(settings),
+                            backgroundTaskManager,
+                            settings.traceEnabled() ? stderrTraceSink(spec, terminalStyle) : TraceSink.noop()
+                    );
+                    AgentRequest request = new AgentRequest(task, maxSteps, requestMetadata(settings), settings.system())
+                            .withModelOptions(modelOptions);
+                    result = agent.run(request);
+                }
+            } catch (IllegalArgumentException | RuntimeProfileException | OpenAiCompatibleException | McpException e) {
                 spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
                 return CommandLine.ExitCode.USAGE;
             }
@@ -390,32 +417,50 @@ public final class AgentCli implements Callable<Integer> {
             return value.substring(0, 500) + "...[truncated]";
         }
 
-        private ModelClient createModelClient() {
+        private RuntimeProfileOverrides runtimeOverrides() {
+            return RuntimeProfileOverrides.builder()
+                    .provider(provider)
+                    .model(model)
+                    .system(systemPrompt)
+                    .mcpEnabled(noMcp ? false : null)
+                    .mcpConfig(noMcp ? null : mcpConfig)
+                    .contextCompressionEnabled(noContextCompression ? false : null)
+                    .contextWindowTokens(contextWindowTokens)
+                    .maxOutputTokens(maxOutputTokens)
+                    .reservedTokens(reservedTokens)
+                    .errorRecoveryEnabled(noErrorRecovery ? false : null)
+                    .modelRetryAttempts(modelRetryAttempts)
+                    .generationMaxOutputTokens(generationMaxOutputTokens)
+                    .recoveryMaxOutputTokens(recoveryMaxOutputTokens)
+                    .traceEnabled(trace ? true : null)
+                    .build();
+        }
+
+        private ModelClient createModelClient(RuntimeSettings settings) {
             if (fixedModelClient != null) {
                 return fixedModelClient;
             }
-            return switch (provider) {
+            return switch (settings.provider()) {
                 case "echo" -> new EchoModelClient();
                 case "openai-compatible" -> {
-                    String resolvedModel = resolveModel();
-                    if (resolvedModel == null) {
+                    if (settings.model() == null || settings.model().isBlank()) {
                         throw new IllegalArgumentException("--model or OPENAI_MODEL is required when --provider openai-compatible.");
                     }
-                    yield OpenAiCompatibleModelClient.fromEnvironment(resolvedModel, environment);
+                    yield OpenAiCompatibleModelClient.fromEnvironment(settings.model(), openAiEnvironment(settings, environment));
                 }
-                default -> throw new IllegalArgumentException("Unknown provider: " + provider);
+                default -> throw new IllegalArgumentException("Unknown provider: " + settings.provider());
             };
         }
 
-        private ContextManager createContextManager() {
-            if (noContextCompression) {
+        private ContextManager createContextManager(RuntimeSettings settings) {
+            if (!settings.contextCompressionEnabled()) {
                 return ContextManager.disabled();
             }
             return ContextManager.withConfig(new ContextCompressionConfig(
                     true,
-                    contextWindowTokens,
-                    maxOutputTokens,
-                    reservedTokens,
+                    settings.contextWindowTokens(),
+                    settings.maxOutputTokens(),
+                    settings.reservedTokens(),
                     ContextCompressionConfig.DEFAULT_TOOL_RESULT_BUDGET_CHARS,
                     ContextCompressionConfig.DEFAULT_MAX_MESSAGES,
                     ContextCompressionConfig.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
@@ -425,25 +470,25 @@ public final class AgentCli implements Callable<Integer> {
             ));
         }
 
-        private ErrorRecoveryConfig createErrorRecoveryConfig() {
-            if (noErrorRecovery) {
+        private ErrorRecoveryConfig createErrorRecoveryConfig(RuntimeSettings settings) {
+            if (!settings.errorRecoveryEnabled()) {
                 return ErrorRecoveryConfig.disabled();
             }
             return new ErrorRecoveryConfig(
                     true,
-                    modelRetryAttempts,
-                    recoveryMaxOutputTokens,
+                    settings.modelRetryAttempts(),
+                    settings.recoveryMaxOutputTokens(),
                     ErrorRecoveryConfig.DEFAULT_BASE_DELAY,
                     true
             );
         }
 
-        private ModelOptions createModelOptions() {
-            return new ModelOptions(generationMaxOutputTokens);
+        private ModelOptions createModelOptions(RuntimeSettings settings) {
+            return new ModelOptions(settings.generationMaxOutputTokens());
         }
 
-        private Map<String, String> requestMetadata() {
-            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(modelIdentityMetadata(provider, model, environment, fixedModelClient != null));
+        private Map<String, String> requestMetadata(RuntimeSettings settings) {
+            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(modelIdentityMetadata(settings, fixedModelClient != null));
             metadata.put(TaskManager.AGENT_NAME_METADATA_KEY, resolvedAgentName());
             return Map.copyOf(metadata);
         }
@@ -457,22 +502,25 @@ public final class AgentCli implements Callable<Integer> {
                 UserApprover userApprover,
                 ModelClient modelClient,
                 MemoryStore memoryStore,
-                MemoryCatalog memoryCatalog
+                MemoryCatalog memoryCatalog,
+                RuntimeSettings settings
         ) {
-            if (memoryWriteEnabled()) {
+            PermissionChecker permissionChecker = new PolicyPermissionChecker(settings, WORKSPACE_ROOT);
+            if (memoryWriteEnabled(settings)) {
                 return HookRegistry.defaultsFor(
                         toolRegistry,
                         userApprover,
                         memoryCatalog,
                         new MemoryExtractor(modelClient),
-                        memoryStore
+                        memoryStore,
+                        permissionChecker
                 );
             }
-            return HookRegistry.defaultsFor(toolRegistry, userApprover, memoryCatalog);
+            return HookRegistry.defaultsFor(toolRegistry, userApprover, memoryCatalog, permissionChecker);
         }
 
-        private boolean memoryWriteEnabled() {
-            return fixedModelClient == null && "openai-compatible".equals(provider);
+        private boolean memoryWriteEnabled(RuntimeSettings settings) {
+            return fixedModelClient == null && settings.persistentMemory() && "openai-compatible".equals(settings.provider());
         }
 
         private void printMemoryWarnings(MemoryCatalog memoryCatalog, TerminalStyle terminalStyle) {
@@ -483,17 +531,6 @@ public final class AgentCli implements Callable<Integer> {
 
         private TerminalStyle createTerminalStyle() {
             return TerminalStyle.of(color, interactiveApproval);
-        }
-
-        private String resolveModel() {
-            if (model != null && !model.isBlank()) {
-                return model.strip();
-            }
-            String environmentModel = environment.get("OPENAI_MODEL");
-            if (environmentModel != null && !environmentModel.isBlank()) {
-                return environmentModel.strip();
-            }
-            return null;
         }
 
         private String resolveTask() throws IOException {
@@ -548,7 +585,10 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--max-steps", defaultValue = "8", description = "Maximum agent loop steps per turn.")
         private int maxSteps;
 
-        @Option(names = "--provider", defaultValue = "echo", description = "Provider to use: echo, openai-compatible.")
+        @Option(names = "--profile", description = "Runtime profile: dev, readonly, or a project profile in .agent/profiles.")
+        private String profile;
+
+        @Option(names = "--provider", description = "Provider to use: echo, openai-compatible.")
         private String provider;
 
         @Option(names = "--model", description = "Model name for --provider openai-compatible. Defaults to OPENAI_MODEL.")
@@ -563,26 +603,26 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--no-context-compression", description = "Disable context compression for this chat session.")
         private boolean noContextCompression;
 
-        @Option(names = "--context-window-tokens", defaultValue = "128000", description = "Estimated context window tokens.")
-        private int contextWindowTokens;
+        @Option(names = "--context-window-tokens", description = "Estimated context window tokens.")
+        private Integer contextWindowTokens;
 
-        @Option(names = "--max-output-tokens", defaultValue = "4000", description = "Estimated output budget reserved for context compression.")
-        private int maxOutputTokens;
+        @Option(names = "--max-output-tokens", description = "Estimated output budget reserved for context compression.")
+        private Integer maxOutputTokens;
 
-        @Option(names = "--reserved-tokens", defaultValue = "13000", description = "Estimated reserved tokens for safety margin.")
-        private int reservedTokens;
+        @Option(names = "--reserved-tokens", description = "Estimated reserved tokens for safety margin.")
+        private Integer reservedTokens;
 
         @Option(names = "--no-error-recovery", description = "Disable model-call error recovery.")
         private boolean noErrorRecovery;
 
-        @Option(names = "--model-retry-attempts", defaultValue = "3", description = "Transient model error retry attempts.")
-        private int modelRetryAttempts;
+        @Option(names = "--model-retry-attempts", description = "Transient model error retry attempts.")
+        private Integer modelRetryAttempts;
 
-        @Option(names = "--generation-max-output-tokens", defaultValue = "8192", description = "Generation max output tokens sent to the provider.")
-        private int generationMaxOutputTokens;
+        @Option(names = "--generation-max-output-tokens", description = "Generation max output tokens sent to the provider.")
+        private Integer generationMaxOutputTokens;
 
-        @Option(names = "--recovery-max-output-tokens", defaultValue = "65536", description = "Max output tokens used for output-truncation recovery.")
-        private int recoveryMaxOutputTokens;
+        @Option(names = "--recovery-max-output-tokens", description = "Max output tokens used for output-truncation recovery.")
+        private Integer recoveryMaxOutputTokens;
 
         @Option(names = "--no-trace", description = "Disable safe runtime trace events in chat.")
         private boolean noTrace;
@@ -605,9 +645,16 @@ public final class AgentCli implements Callable<Integer> {
                 spec.commandLine().getErr().println(e.getMessage());
                 return CommandLine.ExitCode.USAGE;
             }
+            RuntimeSettings settings;
+            try {
+                settings = resolveRuntimeProfile(profile, runtimeOverrides(), environment).settings();
+            } catch (RuntimeProfileException e) {
+                spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
+                return CommandLine.ExitCode.USAGE;
+            }
             try (
                     ChatConsole chatConsole = new ChatConsole(inputReader, spec.commandLine().getErr(), interactiveApproval, terminalStyle);
-                    McpToolProvider mcpToolProvider = createMcpToolProvider(noMcp, mcpConfig)
+                    McpToolProvider mcpToolProvider = createMcpToolProvider(settings)
             ) {
                 chatConsole.start();
                 AgentSession session;
@@ -616,8 +663,8 @@ public final class AgentCli implements Callable<Integer> {
                 CronQueueProcessor cronQueueProcessor;
                 TeamRuntime teamRuntime;
                 TeamInboxPoller teamInboxPoller;
-                modelOptions = createModelOptions();
-                ModelClient modelClient = createModelClient();
+                modelOptions = createModelOptions(settings);
+                ModelClient modelClient = createModelClient(settings);
                 BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.defaults();
                 CronQueue cronQueue = new CronQueue();
                 ScheduledTaskManager scheduledTaskManager = new ScheduledTaskManager(ScheduledJobStore.defaultStore(), cronQueue);
@@ -637,10 +684,11 @@ public final class AgentCli implements Callable<Integer> {
                         memoryCatalog,
                         taskManager,
                         modelOptions,
-                        systemPrompt,
-                        requestMetadata()
+                        settings.system(),
+                        requestMetadata(settings),
+                        new PolicyPermissionChecker(settings, WORKSPACE_ROOT)
                 );
-                ToolRegistry toolRegistry = withMcpTools(
+                ToolRegistry toolRegistry = applyRuntimeToolFilter(withMcpTools(
                         ToolRegistry.defaultToolsWithSubagent(
                                 modelClient,
                                 userApprover,
@@ -651,21 +699,21 @@ public final class AgentCli implements Callable<Integer> {
                                 teamRuntime
                         ),
                         mcpToolProvider
-                );
+                ), settings);
                 session = new AgentSession(new DefaultAgent(
                         modelClient,
                         toolRegistry,
-                        createHookRegistry(toolRegistry, userApprover, modelClient, memoryStore, memoryCatalog),
-                        createContextManager(),
-                        createErrorRecoveryConfig(),
+                        createHookRegistry(toolRegistry, userApprover, modelClient, memoryStore, memoryCatalog, settings),
+                        createContextManager(settings),
+                        createErrorRecoveryConfig(settings),
                         backgroundTaskManager,
-                        noTrace ? TraceSink.noop() : stderrTraceSink(spec, chatConsole, terminalStyle)
+                        settings.traceEnabled() ? stderrTraceSink(spec, chatConsole, terminalStyle) : TraceSink.noop()
                 ), backgroundTaskManager);
                 teamInboxPoller = new TeamInboxPoller(
                         teamRuntime,
                         session,
-                        this::requestMetadata,
-                        systemPrompt,
+                        () -> requestMetadata(settings),
+                        settings.system(),
                         maxSteps,
                         modelOptions,
                         execution -> {
@@ -681,7 +729,7 @@ public final class AgentCli implements Callable<Integer> {
                 cronQueueProcessor = new CronQueueProcessor(
                         cronQueue,
                         session,
-                        task -> createCronRequest(task, modelOptions),
+                        task -> createCronRequest(task, modelOptions, settings),
                         execution -> {
                             chatConsole.beforeAsyncOutput();
                             try {
@@ -724,7 +772,7 @@ public final class AgentCli implements Callable<Integer> {
 
                         AgentResult result;
                         try {
-                            result = session.run(new AgentRequest(task, maxSteps, requestMetadata(), systemPrompt)
+                            result = session.run(new AgentRequest(task, maxSteps, requestMetadata(settings), settings.system())
                                     .withModelOptions(modelOptions));
                         } catch (OpenAiCompatibleException e) {
                             spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
@@ -741,7 +789,7 @@ public final class AgentCli implements Callable<Integer> {
                     cronQueueProcessor.close();
                     cronScheduler.close();
                 }
-            } catch (IllegalArgumentException | OpenAiCompatibleException | McpException e) {
+            } catch (IllegalArgumentException | RuntimeProfileException | OpenAiCompatibleException | McpException e) {
                 spec.commandLine().getErr().println(terminalStyle.error(e.getMessage()));
                 return CommandLine.ExitCode.USAGE;
             } catch (InterruptedException e) {
@@ -750,13 +798,13 @@ public final class AgentCli implements Callable<Integer> {
             }
         }
 
-        private AgentRequest createCronRequest(CronTriggeredTask task, ModelOptions modelOptions) {
-            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(requestMetadata());
+        private AgentRequest createCronRequest(CronTriggeredTask task, ModelOptions modelOptions, RuntimeSettings settings) {
+            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(requestMetadata(settings));
             metadata.put("agent.trigger", "cron");
             metadata.put("agent.cron.jobId", task.job().jobId());
             metadata.put("agent.cron.name", task.job().name());
             metadata.put("agent.cron.type", task.job().type().value());
-            return new AgentRequest(task.asAgentTask(), maxSteps, metadata, systemPrompt)
+            return new AgentRequest(task.asAgentTask(), maxSteps, metadata, settings.system())
                     .withModelOptions(modelOptions);
         }
 
@@ -832,32 +880,50 @@ public final class AgentCli implements Callable<Integer> {
             return value.substring(0, 500) + "...[truncated]";
         }
 
-        private ModelClient createModelClient() {
+        private RuntimeProfileOverrides runtimeOverrides() {
+            return RuntimeProfileOverrides.builder()
+                    .provider(provider)
+                    .model(model)
+                    .system(systemPrompt)
+                    .mcpEnabled(noMcp ? false : null)
+                    .mcpConfig(noMcp ? null : mcpConfig)
+                    .contextCompressionEnabled(noContextCompression ? false : null)
+                    .contextWindowTokens(contextWindowTokens)
+                    .maxOutputTokens(maxOutputTokens)
+                    .reservedTokens(reservedTokens)
+                    .errorRecoveryEnabled(noErrorRecovery ? false : null)
+                    .modelRetryAttempts(modelRetryAttempts)
+                    .generationMaxOutputTokens(generationMaxOutputTokens)
+                    .recoveryMaxOutputTokens(recoveryMaxOutputTokens)
+                    .traceEnabled(noTrace ? false : (profile == null || profile.isBlank() ? true : null))
+                    .build();
+        }
+
+        private ModelClient createModelClient(RuntimeSettings settings) {
             if (fixedModelClient != null) {
                 return fixedModelClient;
             }
-            return switch (provider) {
+            return switch (settings.provider()) {
                 case "echo" -> new EchoModelClient();
                 case "openai-compatible" -> {
-                    String resolvedModel = resolveModel();
-                    if (resolvedModel == null) {
+                    if (settings.model() == null || settings.model().isBlank()) {
                         throw new IllegalArgumentException("--model or OPENAI_MODEL is required when --provider openai-compatible.");
                     }
-                    yield OpenAiCompatibleModelClient.fromEnvironment(resolvedModel, environment);
+                    yield OpenAiCompatibleModelClient.fromEnvironment(settings.model(), openAiEnvironment(settings, environment));
                 }
-                default -> throw new IllegalArgumentException("Unknown provider: " + provider);
+                default -> throw new IllegalArgumentException("Unknown provider: " + settings.provider());
             };
         }
 
-        private ContextManager createContextManager() {
-            if (noContextCompression) {
+        private ContextManager createContextManager(RuntimeSettings settings) {
+            if (!settings.contextCompressionEnabled()) {
                 return ContextManager.disabled();
             }
             return ContextManager.withConfig(new ContextCompressionConfig(
                     true,
-                    contextWindowTokens,
-                    maxOutputTokens,
-                    reservedTokens,
+                    settings.contextWindowTokens(),
+                    settings.maxOutputTokens(),
+                    settings.reservedTokens(),
                     ContextCompressionConfig.DEFAULT_TOOL_RESULT_BUDGET_CHARS,
                     ContextCompressionConfig.DEFAULT_MAX_MESSAGES,
                     ContextCompressionConfig.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP,
@@ -867,25 +933,25 @@ public final class AgentCli implements Callable<Integer> {
             ));
         }
 
-        private ErrorRecoveryConfig createErrorRecoveryConfig() {
-            if (noErrorRecovery) {
+        private ErrorRecoveryConfig createErrorRecoveryConfig(RuntimeSettings settings) {
+            if (!settings.errorRecoveryEnabled()) {
                 return ErrorRecoveryConfig.disabled();
             }
             return new ErrorRecoveryConfig(
                     true,
-                    modelRetryAttempts,
-                    recoveryMaxOutputTokens,
+                    settings.modelRetryAttempts(),
+                    settings.recoveryMaxOutputTokens(),
                     ErrorRecoveryConfig.DEFAULT_BASE_DELAY,
                     true
             );
         }
 
-        private ModelOptions createModelOptions() {
-            return new ModelOptions(generationMaxOutputTokens);
+        private ModelOptions createModelOptions(RuntimeSettings settings) {
+            return new ModelOptions(settings.generationMaxOutputTokens());
         }
 
-        private Map<String, String> requestMetadata() {
-            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(modelIdentityMetadata(provider, model, environment, fixedModelClient != null));
+        private Map<String, String> requestMetadata(RuntimeSettings settings) {
+            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(modelIdentityMetadata(settings, fixedModelClient != null));
             metadata.put(TaskManager.AGENT_NAME_METADATA_KEY, resolvedAgentName());
             return Map.copyOf(metadata);
         }
@@ -899,22 +965,25 @@ public final class AgentCli implements Callable<Integer> {
                 UserApprover userApprover,
                 ModelClient modelClient,
                 MemoryStore memoryStore,
-                MemoryCatalog memoryCatalog
+                MemoryCatalog memoryCatalog,
+                RuntimeSettings settings
         ) {
-            if (memoryWriteEnabled()) {
+            PermissionChecker permissionChecker = new PolicyPermissionChecker(settings, WORKSPACE_ROOT);
+            if (memoryWriteEnabled(settings)) {
                 return HookRegistry.defaultsFor(
                         toolRegistry,
                         userApprover,
                         memoryCatalog,
                         new MemoryExtractor(modelClient),
-                        memoryStore
+                        memoryStore,
+                        permissionChecker
                 );
             }
-            return HookRegistry.defaultsFor(toolRegistry, userApprover, memoryCatalog);
+            return HookRegistry.defaultsFor(toolRegistry, userApprover, memoryCatalog, permissionChecker);
         }
 
-        private boolean memoryWriteEnabled() {
-            return fixedModelClient == null && "openai-compatible".equals(provider);
+        private boolean memoryWriteEnabled(RuntimeSettings settings) {
+            return fixedModelClient == null && settings.persistentMemory() && "openai-compatible".equals(settings.provider());
         }
 
         private void printMemoryWarnings(MemoryCatalog memoryCatalog, TerminalStyle terminalStyle) {
@@ -927,16 +996,6 @@ public final class AgentCli implements Callable<Integer> {
             return TerminalStyle.of(color, interactiveApproval);
         }
 
-        private String resolveModel() {
-            if (model != null && !model.isBlank()) {
-                return model.strip();
-            }
-            String environmentModel = environment.get("OPENAI_MODEL");
-            if (environmentModel != null && !environmentModel.isBlank()) {
-                return environmentModel.strip();
-            }
-            return null;
-        }
     }
 
     static final class ChatConsole implements AutoCloseable {
@@ -1222,6 +1281,57 @@ public final class AgentCli implements Callable<Integer> {
 
             void complete(boolean approved) {
                 result.complete(approved);
+            }
+        }
+    }
+
+    @Command(
+            name = "profile",
+            description = "Inspect runtime profiles."
+    )
+    static final class ProfileCommand implements Callable<Integer> {
+
+        @Spec
+        private CommandSpec spec;
+
+        @Override
+        public Integer call() {
+            spec.commandLine().usage(System.out);
+            return 0;
+        }
+    }
+
+    @Command(name = "show", description = "Show the sanitized effective runtime profile.")
+    static final class ProfileShowCommand implements Callable<Integer> {
+
+        private final Map<String, String> environment;
+
+        ProfileShowCommand() {
+            this(System.getenv());
+        }
+
+        ProfileShowCommand(Map<String, String> environment) {
+            this.environment = Map.copyOf(Objects.requireNonNull(environment, "environment must not be null"));
+        }
+
+        @Spec
+        private CommandSpec spec;
+
+        @Parameters(paramLabel = "NAME", description = "Profile name: dev, readonly, or a project profile.")
+        private String name;
+
+        @Override
+        public Integer call() {
+            try {
+                RuntimeProfileResolution resolution = resolveRuntimeProfile(name, RuntimeProfileOverrides.none(), environment);
+                spec.commandLine().getOut().println(JSON.writerWithDefaultPrettyPrinter().writeValueAsString(resolution.settings().sanitizedMap()));
+                return 0;
+            } catch (RuntimeProfileException e) {
+                spec.commandLine().getErr().println(e.getMessage());
+                return CommandLine.ExitCode.USAGE;
+            } catch (IOException e) {
+                spec.commandLine().getErr().println("failed to render profile: " + e.getMessage());
+                return CommandLine.ExitCode.SOFTWARE;
             }
         }
     }

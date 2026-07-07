@@ -1,0 +1,34 @@
+{
+  "provider": "openai-compatible",
+  "tools": {
+    "local": true,
+    "subagent": true,
+    "team": true,
+    "scheduler": true,
+    "mcp": true,
+    "mcpConfig": ".mcp.json"
+  },
+  "memory": {
+    "persistent": true,
+    "session": true
+  },
+  "contextCompression": {
+    "enabled": true,
+    "contextWindowTokens": 128000,
+    "maxOutputTokens": 4000,
+    "reservedTokens": 13000
+  },
+  "errorRecovery": {
+    "enabled": true,
+    "modelRetryAttempts": 3,
+    "generationMaxOutputTokens": 8192,
+    "recoveryMaxOutputTokens": 65536
+  },
+  "trace": {
+    "enabled": false,
+    "sink": "stderr"
+  },
+  "policy": {
+    "name": "dev"
+  }
+}

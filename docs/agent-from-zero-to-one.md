@@ -2,6 +2,8 @@
 
 这不是一次性总结，而是这个 Java 17 agent 项目的 **Living Roadmap + Decision Log**。它要跟着项目持续更新：每次新增关键能力、调整架构边界、改变安全策略或引入新 provider，都应该同步更新这里。
 
+二期平台化路线见：[Agent 二期：从 CLI Runtime 到可配置 Agent Platform](agent-phase-two-platform-roadmap.md)。
+
 文档保留能力递进主线，但每个阶段都按固定结构维护：
 
 ```text

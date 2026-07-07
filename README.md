@@ -7,6 +7,7 @@
 - `agent-core`: a minimal ReAct-style tool loop with local command/file tools and an echo model client.
 - `agent-mcp`: a stdio MCP client that adapts external MCP tools into the local Tool API.
 - `agent-provider-openai-compatible`: an OpenAI-compatible Chat Completions provider with native tool calling.
+- `agent-runtime`: runtime profile resolution, tool filtering, and profile-aware permission decisions.
 - `agent-cli`: a picocli-based command line entry point for local smoke tests.
 
 ## Requirements
@@ -23,6 +24,7 @@ mvn test
 ## Roadmap and Decisions
 
 - [Agent 从 0 到 1 的关键路径](docs/agent-from-zero-to-one.md): living roadmap and decision log.
+- [Agent 二期：从 CLI Runtime 到可配置 Agent Platform](docs/agent-phase-two-platform-roadmap.md): phase 2 living roadmap and decision log.
 
 ## Run the CLI
 
@@ -42,6 +44,26 @@ Or pipe a task through stdin:
 ```bash
 echo "hello agent" | java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar run
 ```
+
+Use a runtime profile when you want a named capability boundary:
+
+```bash
+java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar run \
+  --profile readonly \
+  "inspect the project"
+
+java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar profile show readonly
+```
+
+Initial project profiles are provided in `.agent/profiles/`:
+
+- `dev.json`: explicit project copy of the default development runtime.
+- `readonly.json`: read-oriented runtime that hides or denies high-risk tools.
+- `openai-compatible.json`: real-provider profile that uses `OPENAI_MODEL`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` from the environment.
+
+`dev` and `readonly` are also built in; a project file can override either one. CLI options such as `--provider`, `--model`, `--system`, `--no-mcp`, and budget flags override the selected profile. Secrets still come from environment variables.
+
+Permission policy files live in `.agent/policies/{name}.json` and are referenced by profile `policy.name`. Policy rules decide `allow`, `ask`, or `deny`; hard safety checks such as workspace escape, symlink escape, `sudo`, and `rm -rf /` cannot be overridden.
 
 Run with an OpenAI-compatible provider:
 

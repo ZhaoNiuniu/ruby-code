@@ -1,0 +1,48 @@
+{
+  "defaultAction": "ask",
+  "tools": {
+    "subagent": "allow",
+    "todo_write": "allow",
+    "load_skill": "allow",
+    "read_file": "allow",
+    "glob": "allow",
+    "bash": "ask",
+    "write_file": "ask",
+    "edit_file": "ask",
+    "mcp__*": "ask",
+    "schedule_task": "allow",
+    "list_scheduled_tasks": "allow",
+    "cancel_scheduled_task": "allow",
+    "create_task": "allow",
+    "list_tasks": "allow",
+    "get_task": "allow",
+    "can_start": "allow",
+    "claim_task": "allow",
+    "complete_task": "allow",
+    "spawn_teammate": "allow",
+    "send_message": "allow",
+    "list_teammates": "allow"
+  },
+  "contexts": {
+    "cron": {
+      "bash": "deny",
+      "write_file": "deny",
+      "edit_file": "deny",
+      "mcp__*": "deny"
+    },
+    "readonly": {
+      "subagent": "deny",
+      "bash": "deny",
+      "write_file": "deny",
+      "edit_file": "deny",
+      "mcp__*": "deny",
+      "create_task": "deny",
+      "claim_task": "deny",
+      "complete_task": "deny",
+      "schedule_task": "deny",
+      "cancel_scheduled_task": "deny",
+      "spawn_teammate": "deny",
+      "send_message": "deny"
+    }
+  }
+}

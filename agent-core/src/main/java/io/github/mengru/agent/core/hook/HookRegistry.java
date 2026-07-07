@@ -4,6 +4,7 @@ import io.github.mengru.agent.core.memory.MemoryCatalog;
 import io.github.mengru.agent.core.memory.MemoryExtractor;
 import io.github.mengru.agent.core.memory.MemoryStore;
 import io.github.mengru.agent.core.permission.DefaultPermissionChecker;
+import io.github.mengru.agent.core.permission.PermissionChecker;
 import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.prompt.PromptAssemblyHook;
 import io.github.mengru.agent.core.prompt.PromptMode;
@@ -48,8 +49,33 @@ public final class HookRegistry {
         return defaultsFor(toolRegistry, userApprover, MemoryCatalog.empty(java.nio.file.Path.of("")));
     }
 
+    public static HookRegistry defaultsFor(
+            ToolRegistry toolRegistry,
+            UserApprover userApprover,
+            PermissionChecker permissionChecker
+    ) {
+        return defaultsFor(
+                toolRegistry,
+                userApprover,
+                MemoryCatalog.empty(java.nio.file.Path.of("")),
+                null,
+                null,
+                PromptMode.MAIN,
+                permissionChecker
+        );
+    }
+
     public static HookRegistry defaultsFor(ToolRegistry toolRegistry, UserApprover userApprover, MemoryCatalog memoryCatalog) {
         return defaultsFor(toolRegistry, userApprover, memoryCatalog, null, null);
+    }
+
+    public static HookRegistry defaultsFor(
+            ToolRegistry toolRegistry,
+            UserApprover userApprover,
+            MemoryCatalog memoryCatalog,
+            PermissionChecker permissionChecker
+    ) {
+        return defaultsFor(toolRegistry, userApprover, memoryCatalog, null, null, PromptMode.MAIN, permissionChecker);
     }
 
     public static HookRegistry defaultsFor(
@@ -77,7 +103,46 @@ public final class HookRegistry {
             MemoryCatalog memoryCatalog,
             MemoryExtractor memoryExtractor,
             MemoryStore memoryStore,
+            PermissionChecker permissionChecker
+    ) {
+        return defaultsFor(
+                toolRegistry,
+                userApprover,
+                memoryCatalog,
+                memoryExtractor,
+                memoryStore,
+                PromptMode.MAIN,
+                permissionChecker
+        );
+    }
+
+    public static HookRegistry defaultsFor(
+            ToolRegistry toolRegistry,
+            UserApprover userApprover,
+            MemoryCatalog memoryCatalog,
+            MemoryExtractor memoryExtractor,
+            MemoryStore memoryStore,
             PromptMode promptMode
+    ) {
+        return defaultsFor(
+                toolRegistry,
+                userApprover,
+                memoryCatalog,
+                memoryExtractor,
+                memoryStore,
+                promptMode,
+                new DefaultPermissionChecker()
+        );
+    }
+
+    public static HookRegistry defaultsFor(
+            ToolRegistry toolRegistry,
+            UserApprover userApprover,
+            MemoryCatalog memoryCatalog,
+            MemoryExtractor memoryExtractor,
+            MemoryStore memoryStore,
+            PromptMode promptMode,
+            PermissionChecker permissionChecker
     ) {
         Objects.requireNonNull(toolRegistry, "toolRegistry must not be null");
         Objects.requireNonNull(memoryCatalog, "memoryCatalog must not be null");
@@ -92,7 +157,7 @@ public final class HookRegistry {
         if (memoryExtractor != null && memoryStore != null) {
             registry.registerHook(HookEvent.STOP, new MemoryExtractionHook(memoryExtractor, memoryStore));
         }
-        return registry.registerDefaultPermissionHook(userApprover);
+        return registry.registerDefaultPermissionHook(userApprover, permissionChecker);
     }
 
     private static SkillCatalog skillCatalogFrom(ToolRegistry toolRegistry) {
@@ -110,9 +175,16 @@ public final class HookRegistry {
     }
 
     private HookRegistry registerDefaultPermissionHook(UserApprover userApprover) {
+        return registerDefaultPermissionHook(userApprover, new DefaultPermissionChecker());
+    }
+
+    private HookRegistry registerDefaultPermissionHook(UserApprover userApprover, PermissionChecker permissionChecker) {
         return registerHook(
                 HookEvent.PRE_TOOL_USE,
-                new PreToolUsePermissionHook(new DefaultPermissionChecker(), Objects.requireNonNull(userApprover, "userApprover must not be null"))
+                new PreToolUsePermissionHook(
+                        Objects.requireNonNull(permissionChecker, "permissionChecker must not be null"),
+                        Objects.requireNonNull(userApprover, "userApprover must not be null")
+                )
         );
     }
 

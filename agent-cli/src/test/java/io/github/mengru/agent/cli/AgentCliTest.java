@@ -248,6 +248,64 @@ class AgentCliTest {
     }
 
     @Test
+    void runReadonlyProfileHidesHighRiskTools() {
+        AtomicReference<java.util.List<String>> toolNames = new AtomicReference<>();
+        ModelClient model = (request, previousSteps, tools) -> {
+            toolNames.set(tools.stream().map(Tool::name).toList());
+            return AgentStep.finalAnswer("ok");
+        };
+        StringWriter out = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                model
+        );
+        commandLine.setOut(new PrintWriter(out));
+
+        int exitCode = commandLine.execute("run", "--profile", "readonly", "inspect");
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("ok");
+        assertThat(toolNames.get()).contains("read_file", "glob", "list_tasks", "get_task", "can_start");
+        assertThat(toolNames.get()).doesNotContain("bash", "write_file", "edit_file", "subagent");
+        assertThat(toolNames.get()).doesNotContain("create_task", "claim_task", "complete_task");
+    }
+
+    @Test
+    void profileShowPrintsSanitizedEffectiveProfile() {
+        StringWriter out = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(Map.of(
+                "OPENAI_API_KEY", "secret-key",
+                "OPENAI_MODEL", "env-model"
+        ));
+        commandLine.setOut(new PrintWriter(out));
+
+        int exitCode = commandLine.execute("profile", "show", "readonly");
+
+        assertThat(exitCode).isZero();
+        assertThat(out.toString()).contains("\"profile\" : \"readonly\"");
+        assertThat(out.toString()).contains("\"policy\" :");
+        assertThat(out.toString()).contains("\"name\" : \"readonly\"");
+        assertThat(out.toString()).contains("\"defaultAction\" : \"ask\"");
+        assertThat(out.toString()).contains("\"contexts\" :");
+        assertThat(out.toString()).contains("\"mcp\" : false");
+        assertThat(out.toString()).doesNotContain("secret-key");
+    }
+
+    @Test
+    void profileShowFailsForMissingCustomProfile() {
+        StringWriter err = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(Map.of());
+        commandLine.setErr(new PrintWriter(err));
+
+        int exitCode = commandLine.execute("profile", "show", "missing_profile");
+
+        assertThat(exitCode).isEqualTo(CommandLine.ExitCode.USAGE);
+        assertThat(err.toString()).contains("Runtime profile not found");
+    }
+
+    @Test
     void runPassesAgentNameMetadata() {
         AtomicReference<String> seenAgentName = new AtomicReference<>();
         StringWriter out = new StringWriter();

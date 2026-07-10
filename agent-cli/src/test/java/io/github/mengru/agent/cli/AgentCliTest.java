@@ -9,6 +9,7 @@ import io.github.mengru.agent.api.ModelClient;
 import io.github.mengru.agent.api.ModelException;
 import io.github.mengru.agent.api.Tool;
 import io.github.mengru.agent.api.TraceEvent;
+import io.github.mengru.agent.core.audit.RunAuditSummary;
 import io.github.mengru.agent.core.permission.PermissionDecision;
 import io.github.mengru.agent.core.permission.PermissionRequest;
 import org.junit.jupiter.api.Test;
@@ -528,6 +529,55 @@ class AgentCliTest {
     }
 
     @Test
+    void runWritesAuditByDefaultAndRunsCommandsCanReadIt() throws IOException {
+        StringWriter out = new StringWriter();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("audit cli ok")
+        );
+        commandLine.setOut(new PrintWriter(out));
+
+        int exitCode = commandLine.execute("run", "audit", "cli");
+
+        assertThat(exitCode).isZero();
+        RunAuditSummary summary = latestRunSummary();
+        assertThat(summary.status()).isEqualTo("completed");
+        assertThat(summary.summary()).contains("audit cli ok");
+
+        StringWriter listOut = new StringWriter();
+        CommandLine listCommand = AgentCli.newCommandLine(Map.of());
+        listCommand.setOut(new PrintWriter(listOut));
+        assertThat(listCommand.execute("runs", "list", "--limit", "1")).isZero();
+        assertThat(listOut.toString()).contains(summary.runId()).contains("completed");
+
+        StringWriter showOut = new StringWriter();
+        CommandLine showCommand = AgentCli.newCommandLine(Map.of());
+        showCommand.setOut(new PrintWriter(showOut));
+        assertThat(showCommand.execute("runs", "show", summary.runId(), "--json")).isZero();
+        assertThat(showOut.toString()).contains("\"runId\":\"" + summary.runId() + "\"");
+        assertThat(showOut.toString()).contains("\"type\":\"MODEL_CALL\"");
+    }
+
+    @Test
+    void noAuditDoesNotWriteRunFile() throws IOException {
+        List<String> before = auditIndexLines();
+        CommandLine commandLine = AgentCli.newCommandLine(
+                Map.of(),
+                new ByteArrayInputStream(new byte[0]),
+                false,
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("no audit")
+        );
+        commandLine.setOut(new PrintWriter(new StringWriter()));
+
+        int exitCode = commandLine.execute("run", "--no-audit", "hello");
+
+        assertThat(exitCode).isZero();
+        assertThat(auditIndexLines()).hasSize(before.size());
+    }
+
+    @Test
     void runTracePrintsToStderrAndLeavesStdoutForFinalAnswer() {
         StringWriter out = new StringWriter();
         StringWriter err = new StringWriter();
@@ -546,6 +596,7 @@ class AgentCliTest {
         assertThat(out.toString()).contains("ok");
         assertThat(out.toString()).doesNotContain("[trace]");
         assertThat(err.toString()).contains("[trace] model_call status=start phase=main");
+        assertThat(err.toString()).contains("runId=run_");
         assertThat(err.toString()).contains("[trace] final_answer completed=true");
     }
 
@@ -675,6 +726,7 @@ class AgentCliTest {
         assertThat(out.toString()).contains("assistant> ok");
         assertThat(out.toString()).doesNotContain("[trace]");
         assertThat(err.toString()).contains("[trace] model_call status=start phase=main");
+        assertThat(err.toString()).contains("runId=run_");
     }
 
     @Test
@@ -1225,6 +1277,22 @@ class AgentCliTest {
         for (int i = 0; i < 50 && !console.isWaitingForInput(); i++) {
             Thread.sleep(20);
         }
+    }
+
+    private static RunAuditSummary latestRunSummary() throws IOException {
+        List<String> lines = auditIndexLines();
+        assertThat(lines).isNotEmpty();
+        return TEST_MAPPER.readValue(lines.get(lines.size() - 1), RunAuditSummary.class);
+    }
+
+    private static List<String> auditIndexLines() throws IOException {
+        Path index = Path.of(".runs", "RUNS.jsonl");
+        if (!Files.exists(index)) {
+            return List.of();
+        }
+        return Files.readAllLines(index, StandardCharsets.UTF_8).stream()
+                .filter(line -> !line.isBlank())
+                .toList();
     }
 
     private void writeMemory(String fileName, String name, String description, String type, String body) throws IOException {

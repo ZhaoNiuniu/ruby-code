@@ -95,7 +95,16 @@ public final class AgentSession {
                             )
                     ));
                 }
-                return new AgentResult(result.output(), result.steps(), result.completed(), allEvents, result.recoveryEvents(), traceEvents);
+                return new AgentResult(
+                        result.output(),
+                        result.steps(),
+                        result.completed(),
+                        allEvents,
+                        result.recoveryEvents(),
+                        traceEvents,
+                        result.runId(),
+                        result.auditEvents()
+                );
             }
         }
         return result;

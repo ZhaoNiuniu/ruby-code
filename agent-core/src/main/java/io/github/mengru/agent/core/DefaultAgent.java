@@ -1,6 +1,7 @@
 package io.github.mengru.agent.core;
 
 import io.github.mengru.agent.api.Agent;
+import io.github.mengru.agent.api.AuditEvent;
 import io.github.mengru.agent.api.AgentRecoveryEvent;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
@@ -15,6 +16,8 @@ import io.github.mengru.agent.api.ToolRequest;
 import io.github.mengru.agent.api.ToolResult;
 import io.github.mengru.agent.api.TraceEvent;
 import io.github.mengru.agent.core.background.BackgroundTaskManager;
+import io.github.mengru.agent.core.audit.RunAuditSink;
+import io.github.mengru.agent.core.audit.RunAuditSummary;
 import io.github.mengru.agent.core.context.ContextManager;
 import io.github.mengru.agent.core.hook.HookEvent;
 import io.github.mengru.agent.core.hook.HookRegistry;
@@ -48,6 +51,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class DefaultAgent implements Agent {
 
@@ -60,6 +65,8 @@ public final class DefaultAgent implements Agent {
     private final ModelCallRecovery modelCallRecovery;
     private final BackgroundTaskManager backgroundTaskManager;
     private final TraceSink traceSink;
+    private final RunAuditSink runAuditSink;
+    private final ThreadLocal<String> activeRunId = new ThreadLocal<>();
 
     public DefaultAgent(ModelClient modelClient, List<Tool> tools) {
         this(modelClient, ToolRegistry.of(tools));
@@ -148,9 +155,35 @@ public final class DefaultAgent implements Agent {
             ToolRegistry toolRegistry,
             HookRegistry hookRegistry,
             ContextManager contextManager,
+            ErrorRecoveryConfig errorRecoveryConfig,
+            BackgroundTaskManager backgroundTaskManager,
+            TraceSink traceSink,
+            RunAuditSink runAuditSink
+    ) {
+        this(modelClient, toolRegistry, hookRegistry, contextManager, new ModelCallRecovery(errorRecoveryConfig), backgroundTaskManager, traceSink, runAuditSink);
+    }
+
+    public DefaultAgent(
+            ModelClient modelClient,
+            ToolRegistry toolRegistry,
+            HookRegistry hookRegistry,
+            ContextManager contextManager,
             ModelCallRecovery modelCallRecovery,
             BackgroundTaskManager backgroundTaskManager,
             TraceSink traceSink
+    ) {
+        this(modelClient, toolRegistry, hookRegistry, contextManager, modelCallRecovery, backgroundTaskManager, traceSink, RunAuditSink.noop());
+    }
+
+    public DefaultAgent(
+            ModelClient modelClient,
+            ToolRegistry toolRegistry,
+            HookRegistry hookRegistry,
+            ContextManager contextManager,
+            ModelCallRecovery modelCallRecovery,
+            BackgroundTaskManager backgroundTaskManager,
+            TraceSink traceSink,
+            RunAuditSink runAuditSink
     ) {
         this.modelClient = Objects.requireNonNull(modelClient, "modelClient must not be null");
         this.toolRegistry = Objects.requireNonNull(toolRegistry, "toolRegistry must not be null");
@@ -159,11 +192,22 @@ public final class DefaultAgent implements Agent {
         this.modelCallRecovery = Objects.requireNonNull(modelCallRecovery, "modelCallRecovery must not be null");
         this.backgroundTaskManager = Objects.requireNonNull(backgroundTaskManager, "backgroundTaskManager must not be null");
         this.traceSink = Objects.requireNonNull(traceSink, "traceSink must not be null");
+        this.runAuditSink = Objects.requireNonNull(runAuditSink, "runAuditSink must not be null");
     }
 
     @Override
     public AgentResult run(AgentRequest request) {
         Objects.requireNonNull(request, "request must not be null");
+        RunAuditRun auditRun = RunAuditRun.from(request, runAuditSink);
+        activeRunId.set(auditRun.runId());
+        try {
+            return runWithAudit(request, auditRun);
+        } finally {
+            activeRunId.remove();
+        }
+    }
+
+    private AgentResult runWithAudit(AgentRequest request, RunAuditRun auditRun) {
         List<AgentStep> steps = new ArrayList<>();
         List<ContextCompressionEvent> compressionEvents = new ArrayList<>();
         List<AgentRecoveryEvent> recoveryEvents = new ArrayList<>();
@@ -177,12 +221,12 @@ public final class DefaultAgent implements Agent {
             );
             if (promptResult.outcome() == HookResult.Outcome.BLOCK) {
                 emitTrace(traceEvents, errorTrace("user-prompt-blocked", promptResult.reason()));
-                return finish(request, steps, new AgentResult("hook blocked UserPromptSubmit: " + promptResult.reason(), steps, false, compressionEvents, recoveryEvents, traceEvents), "user-prompt-blocked");
+                return finish(request, steps, new AgentResult("hook blocked UserPromptSubmit: " + promptResult.reason(), steps, false, compressionEvents, recoveryEvents, traceEvents), "user-prompt-blocked", auditRun);
             }
             effectiveRequest = promptResult.context().request();
         } catch (RuntimeException e) {
             emitTrace(traceEvents, errorTrace("user-prompt-error", e.getMessage()));
-            return finish(request, steps, new AgentResult("UserPromptSubmit hook failed: " + e.getMessage(), steps, false, compressionEvents, recoveryEvents, traceEvents), "user-prompt-error");
+            return finish(request, steps, new AgentResult("UserPromptSubmit hook failed: " + e.getMessage(), steps, false, compressionEvents, recoveryEvents, traceEvents), "user-prompt-error", auditRun);
         }
         appendNotifications(steps, effectiveRequest.notifications(), traceEvents);
 
@@ -202,7 +246,8 @@ public final class DefaultAgent implements Agent {
                         effectiveRequest,
                         steps,
                         new AgentResult(contextView.failureMessage(), steps, false, compressionEvents, recoveryEvents, traceEvents),
-                        "context-compression-error"
+                        "context-compression-error",
+                        auditRun
                 );
             }
             effectiveRequest = contextView.request();
@@ -224,7 +269,8 @@ public final class DefaultAgent implements Agent {
                         effectiveRequest,
                         steps,
                         new AgentResult(modelCallResult.failureMessage(), steps, false, compressionEvents, recoveryEvents, traceEvents),
-                        modelCallResult.reason()
+                        modelCallResult.reason(),
+                        auditRun
                 );
             }
             AgentStep nextStep = modelCallResult.step();
@@ -234,11 +280,11 @@ public final class DefaultAgent implements Agent {
 
             if (nextStep.type() == AgentStep.Type.FINAL_ANSWER) {
                 emitTrace(traceEvents, finalAnswerTrace(true));
-                return finish(effectiveRequest, steps, new AgentResult(nextStep.content(), steps, true, compressionEvents, recoveryEvents, traceEvents), "final-answer");
+                return finish(effectiveRequest, steps, new AgentResult(nextStep.content(), steps, true, compressionEvents, recoveryEvents, traceEvents), "final-answer", auditRun);
             }
             if (nextStep.type() == AgentStep.Type.ERROR) {
                 emitTrace(traceEvents, errorTrace("model-error", nextStep.content()));
-                return finish(effectiveRequest, steps, new AgentResult(nextStep.content(), steps, false, compressionEvents, recoveryEvents, traceEvents), "model-error");
+                return finish(effectiveRequest, steps, new AgentResult(nextStep.content(), steps, false, compressionEvents, recoveryEvents, traceEvents), "model-error", auditRun);
             }
             if (nextStep.type() == AgentStep.Type.TOOL_CALL) {
                 emitTrace(traceEvents, toolCallTrace(nextStep));
@@ -246,14 +292,14 @@ public final class DefaultAgent implements Agent {
                 steps.add(toolStep);
                 emitTrace(traceEvents, toolResultTrace(toolStep));
                 if (toolStep.type() == AgentStep.Type.ERROR) {
-                    return finish(effectiveRequest, steps, new AgentResult(toolStep.content(), steps, false, compressionEvents, recoveryEvents, traceEvents), "tool-error");
+                    return finish(effectiveRequest, steps, new AgentResult(toolStep.content(), steps, false, compressionEvents, recoveryEvents, traceEvents), "tool-error", auditRun);
                 }
             }
         }
 
         String output = steps.isEmpty() ? "" : steps.get(steps.size() - 1).content();
         emitTrace(traceEvents, errorTrace("max-steps", output));
-        return finish(effectiveRequest, steps, new AgentResult(output, steps, false, compressionEvents, recoveryEvents, traceEvents), "max-steps");
+        return finish(effectiveRequest, steps, new AgentResult(output, steps, false, compressionEvents, recoveryEvents, traceEvents), "max-steps", auditRun);
     }
 
     private ModelCallResult callModelWithRecovery(
@@ -623,12 +669,23 @@ public final class DefaultAgent implements Agent {
     }
 
     private void emitTrace(List<TraceEvent> traceEvents, TraceEvent event) {
-        traceEvents.add(event);
+        TraceEvent enriched = enrichTraceWithRunId(event);
+        traceEvents.add(enriched);
         try {
-            traceSink.emit(event);
+            traceSink.emit(enriched);
         } catch (RuntimeException e) {
             LOG.debug("Trace sink failed: {}", e.getMessage());
         }
+    }
+
+    private TraceEvent enrichTraceWithRunId(TraceEvent event) {
+        String runId = activeRunId.get();
+        if (runId == null || runId.isBlank() || event.attributes().containsKey("runId")) {
+            return event;
+        }
+        LinkedHashMap<String, String> attributes = new LinkedHashMap<>(event.attributes());
+        attributes.put("runId", runId);
+        return TraceEvent.of(event.type(), attributes);
     }
 
     private TraceEvent modelCallTrace(String status, String phase, String errorCode) {
@@ -782,18 +839,203 @@ public final class DefaultAgent implements Agent {
     private record Summary(String text, boolean truncated) {
     }
 
-    private AgentResult finish(AgentRequest request, List<AgentStep> steps, AgentResult result, String reason) {
+    private AgentResult finish(AgentRequest request, List<AgentStep> steps, AgentResult result, String reason, RunAuditRun auditRun) {
         try {
             HookResult<StopContext> stopResult = hookRegistry.triggerHooks(
                     HookEvent.STOP,
                     new StopContext(request, steps, result, reason)
             );
             if (stopResult.outcome() == HookResult.Outcome.BLOCK) {
-                return new AgentResult("Stop hook blocked result: " + stopResult.reason(), steps, false, result.compressionEvents(), result.recoveryEvents(), result.traceEvents());
+                return auditRun.complete(new AgentResult("Stop hook blocked result: " + stopResult.reason(), steps, false, result.compressionEvents(), result.recoveryEvents(), result.traceEvents()), "stop-hook-blocked");
             }
-            return stopResult.context().result();
+            return auditRun.complete(stopResult.context().result(), reason);
         } catch (RuntimeException e) {
-            return new AgentResult("Stop hook failed: " + e.getMessage(), steps, false, result.compressionEvents(), result.recoveryEvents(), result.traceEvents());
+            return auditRun.complete(new AgentResult("Stop hook failed: " + e.getMessage(), steps, false, result.compressionEvents(), result.recoveryEvents(), result.traceEvents()), "stop-hook-error");
+        }
+    }
+
+    private static final class RunAuditRun {
+
+        static final String RUN_ID_METADATA_KEY = "agent.run.id";
+        static final String PARENT_RUN_ID_METADATA_KEY = "agent.parentRunId";
+        static final String CORRELATION_ID_METADATA_KEY = "agent.correlationId";
+        static final String ACTOR_METADATA_KEY = "agent.actor";
+
+        private final String runId;
+        private final String parentRunId;
+        private final String correlationId;
+        private final String actor;
+        private final String trigger;
+        private final String profileName;
+        private final String policyName;
+        private final String startedAt;
+        private final RunAuditSink sink;
+        private final AtomicLong sequence = new AtomicLong();
+
+        private RunAuditRun(
+                String runId,
+                String parentRunId,
+                String correlationId,
+                String actor,
+                String trigger,
+                String profileName,
+                String policyName,
+                String startedAt,
+                RunAuditSink sink
+        ) {
+            this.runId = runId;
+            this.parentRunId = parentRunId;
+            this.correlationId = correlationId;
+            this.actor = actor;
+            this.trigger = trigger;
+            this.profileName = profileName;
+            this.policyName = policyName;
+            this.startedAt = startedAt;
+            this.sink = sink;
+        }
+
+        static RunAuditRun from(AgentRequest request, RunAuditSink sink) {
+            Map<String, String> metadata = request.metadata();
+            String runId = firstNonBlank(metadata.get(RUN_ID_METADATA_KEY), "run_" + UUID.randomUUID().toString().replace("-", ""));
+            String actor = firstNonBlank(metadata.get(ACTOR_METADATA_KEY), metadata.getOrDefault("agent.name", "agent"));
+            return new RunAuditRun(
+                    runId,
+                    metadata.getOrDefault(PARENT_RUN_ID_METADATA_KEY, ""),
+                    metadata.getOrDefault(CORRELATION_ID_METADATA_KEY, ""),
+                    actor,
+                    metadata.getOrDefault("agent.trigger", "user"),
+                    metadata.getOrDefault("agent.profile.name", ""),
+                    metadata.getOrDefault("agent.policy.name", ""),
+                    java.time.Instant.now().toString(),
+                    sink
+            );
+        }
+
+        String runId() {
+            return runId;
+        }
+
+        AgentResult complete(AgentResult result, String reason) {
+            ArrayList<AuditEvent> auditEvents = new ArrayList<>();
+            LinkedHashMap<String, String> startAttributes = ordered(
+                    "trigger", trigger,
+                    "reason", "start"
+            );
+            if (!profileName.isBlank()) {
+                startAttributes.put("profile", profileName);
+            }
+            if (!policyName.isBlank()) {
+                startAttributes.put("policy", policyName);
+            }
+            emit(auditEvents, AuditEvent.Type.RUN_START, "", startAttributes);
+            for (TraceEvent traceEvent : result.traceEvents()) {
+                LinkedHashMap<String, String> attributes = new LinkedHashMap<>(traceEvent.attributes());
+                String phase = attributes.remove("phase");
+                attributes.remove("runId");
+                if (traceEvent.type() == TraceEvent.Type.PERMISSION_DENIED) {
+                    attributes.put("action", "deny");
+                }
+                emit(auditEvents, toAuditType(traceEvent.type()), phase == null ? "" : phase, attributes);
+            }
+            emit(auditEvents, AuditEvent.Type.RUN_END, "", ordered(
+                    "status", result.completed() ? "completed" : "failed",
+                    "reason", reason,
+                    "summary", summarize(result.output())
+            ));
+            RunAuditSummary summary = new RunAuditSummary(
+                    runId,
+                    parentRunId,
+                    actor,
+                    trigger,
+                    startedAt,
+                    java.time.Instant.now().toString(),
+                    result.completed() ? "completed" : "failed",
+                    summarize(result.output())
+            );
+            try {
+                sink.closeRun(summary);
+            } catch (RuntimeException e) {
+                addAuditSinkFailure(auditEvents, "close-run", e);
+            }
+            return new AgentResult(
+                    result.output(),
+                    result.steps(),
+                    result.completed(),
+                    result.compressionEvents(),
+                    result.recoveryEvents(),
+                    result.traceEvents(),
+                    runId,
+                    auditEvents
+            );
+        }
+
+        private void emit(List<AuditEvent> auditEvents, AuditEvent.Type type, String phase, Map<String, String> attributes) {
+            AuditEvent event = AuditEvent.of(
+                    runId,
+                    sequence.incrementAndGet(),
+                    type,
+                    actor,
+                    phase,
+                    parentRunId,
+                    correlationId,
+                    attributes
+            );
+            auditEvents.add(event);
+            try {
+                sink.emit(event);
+            } catch (RuntimeException e) {
+                addAuditSinkFailure(auditEvents, "emit", e);
+            }
+        }
+
+        private void addAuditSinkFailure(List<AuditEvent> auditEvents, String operation, RuntimeException failure) {
+            String message = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
+            System.err.println("[audit] failed to write run audit " + operation + ": " + message);
+            auditEvents.add(AuditEvent.of(
+                    runId,
+                    sequence.incrementAndGet(),
+                    AuditEvent.Type.ERROR,
+                    actor,
+                    "audit",
+                    parentRunId,
+                    correlationId,
+                    ordered(
+                            "reason", "audit-write-failed",
+                            "operation", operation,
+                            "message", summarize(message)
+                    )
+            ));
+        }
+
+        private static AuditEvent.Type toAuditType(TraceEvent.Type type) {
+            return switch (type) {
+                case MODEL_CALL -> AuditEvent.Type.MODEL_CALL;
+                case TOOL_CALL -> AuditEvent.Type.TOOL_CALL;
+                case TOOL_RESULT -> AuditEvent.Type.TOOL_RESULT;
+                case TASK_NOTIFICATION -> AuditEvent.Type.TASK_NOTIFICATION;
+                case COMPRESSION -> AuditEvent.Type.COMPRESSION;
+                case RECOVERY -> AuditEvent.Type.RECOVERY;
+                case PERMISSION_DENIED -> AuditEvent.Type.PERMISSION_DENIED;
+                case ERROR -> AuditEvent.Type.ERROR;
+                case FINAL_ANSWER -> AuditEvent.Type.FINAL_ANSWER;
+            };
+        }
+
+        private static String firstNonBlank(String first, String fallback) {
+            return first == null || first.isBlank() ? fallback : first.strip();
+        }
+
+        private static LinkedHashMap<String, String> ordered(String... pairs) {
+            LinkedHashMap<String, String> attributes = new LinkedHashMap<>();
+            for (int i = 0; pairs != null && i + 1 < pairs.length; i += 2) {
+                attributes.put(pairs[i], pairs[i + 1] == null ? "" : pairs[i + 1]);
+            }
+            return attributes;
+        }
+
+        private static String summarize(String output) {
+            String normalized = output == null ? "" : output.strip().replaceAll("\\s+", " ");
+            return normalized.length() <= 500 ? normalized : normalized.substring(0, 500);
         }
     }
 

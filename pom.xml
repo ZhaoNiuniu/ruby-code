@@ -18,6 +18,7 @@
         <module>agent-runtime</module>
         <module>agent-provider-openai-compatible</module>
         <module>agent-cli</module>
+        <module>agent-evals</module>
     </modules>
 
     <properties>

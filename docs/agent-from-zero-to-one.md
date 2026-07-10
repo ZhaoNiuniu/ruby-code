@@ -12,9 +12,9 @@ Status / Why / Current implementation / Next
 
 ## Current Focus
 
-- 当前阶段：命令行可用的 OpenAI-compatible agent，具备 stdio MCP tools、chat 进程内 agent team、多 Agent task system、运行时 system prompt assembly、error recovery、安全 realtime trace、chat 进程内 cron scheduler、chat 进程内 background tasks、长期 persistent memory、进程内 conversation session、上下文压缩、原生 tool calling、todo planning、subagent 上下文隔离、按需 skill 加载、本地五工具、hook registry 和执行前权限闸门。
-- 当前重点：把 MCP 外部工具接入、agent team 通信、task graph、prompt 生成、错误恢复、运行态可观测、定时自动交付、慢操作后台化、长期记忆、干净会话续接、任务规划、上下文隔离、按需上下文加载、工具执行、安全审批、hook 扩展和 provider 扩展沉淀成稳定工程边界。
-- Last updated: 2026-07-06
+- 当前阶段：命令行可用的 OpenAI-compatible agent，具备 runtime profile、policy config、持久 run audit、deterministic behavioral eval、stdio MCP tools、chat 进程内 agent team、多 Agent task system、运行时 system prompt assembly、error recovery、安全 realtime trace、chat 进程内 cron scheduler、chat 进程内 background tasks、长期 persistent memory、进程内 conversation session、上下文压缩、原生 tool calling、todo planning、subagent 上下文隔离、按需 skill 加载、本地五工具、hook registry 和执行前权限闸门。
+- 当前重点：把 profile/policy/audit/eval、MCP 外部工具接入、agent team 通信、task graph、prompt 生成、错误恢复、运行态可观测、定时自动交付、慢操作后台化、长期记忆、干净会话续接、任务规划、上下文隔离、按需上下文加载、工具执行、安全审批、hook 扩展和 provider 扩展沉淀成稳定工程边界。
+- Last updated: 2026-07-07
 
 ## Decision Log
 
@@ -41,6 +41,8 @@ Status / Why / Current implementation / Next
 | 2026-07-01 | `agent chat` 支持进程内后台 `bash` 任务，完成后用独立 `TASK_NOTIFICATION` 注入 | 慢操作不阻塞主循环，同时保持 OpenAI tool_call/tool_result 一一配对合法 |
 | 2026-07-01 | `AgentStep` 增加 provider metadata，OpenAI-compatible provider 保存并回传 `reasoning_content` | 兼容 DeepSeek/Qwen 等 thinking 模式要求，把 provider 特有协议留在 provider 层 |
 | 2026-07-01 | 新增安全 runtime trace：chat 默认开、run 需 `--trace`，stderr 单行输出，最终答案留在 stdout | 提供类似 Codex 的运行态可观测性，但不默认暴露 provider reasoning_content 或模型原始长思考 |
+| 2026-07-07 | 新增持久 run audit：默认写 `.runs/{runId}.jsonl` 和 `.runs/RUNS.jsonl`，只保存 Safe Summary | 让每次 run/chat/team/cron turn 可复盘，同时不把 provider reasoning、API key、raw messages 或完整工具 payload 写入日志 |
+| 2026-07-07 | 新增 `agent-evals` deterministic behavioral eval，使用 JSON case + scripted model + `AuditEvent` oracle | 固定 tool/permission/MCP/team/recovery 这些 runtime 行为，避免只靠单元测试遗漏 agent 行为漂移 |
 | 2026-07-01 | `agent chat` 增加进程内 cron scheduler，调度管理先作为普通工具，durable 定义写 `.scheduled_tasks.json` | 让 agent 可以在空闲时自动处理定时任务，同时保持无人值守权限默认拒绝和本机私有持久化 |
 | 2026-07-02 | 新增 `.tasks/{id}.json` task system，默认可提交，owner 来自 `--agent-name`，subagent 只读 | 为多 Agent 分工提供可恢复任务图，同时避免调查型 subagent 直接改写项目队列 |
 | 2026-07-02 | `agent chat` 增加进程内 agent team，队友通过 `.teams/{teamId}/inboxes/*.jsonl` 通信，Lead 自动消费 inbox | 用持久队友上下文承担并行协作，同时保持当前进程生命周期、文件邮箱和人工审批边界清晰 |
@@ -619,13 +621,14 @@ system prompt 不能继续由 `AgentRequest` 默认值、多个 `UserPromptSubmi
 
 **Current implementation:**
 
-- `TraceEvent` 挂在 `AgentResult.traceEvents()` 上。
+- `TraceEvent` 挂在 `AgentResult.traceEvents()` 上；`AuditEvent` 挂在 `AgentResult.auditEvents()` 上。
 - `DefaultAgent` 在主 loop 中记录以下事件：`MODEL_CALL`、`TOOL_CALL`、`TOOL_RESULT`、`TASK_NOTIFICATION`、`COMPRESSION`、`RECOVERY`、`PERMISSION_DENIED`、`ERROR`、`FINAL_ANSWER`。
 - `TraceSink` 支持实时输出；CLI 使用 stderr sink，SDK 默认 no-op。
+- `RunAuditSink` 支持持久 JSONL 输出；CLI 默认写 `.runs/{runId}.jsonl` 和 `.runs/RUNS.jsonl`，可用 `--no-audit` 关闭。
 - `TraceFormatter` 使用单行格式，例如：
 
 ```text
-[trace] tool_call tool=bash args="command=pwd" truncated=false
+[trace] tool_call tool=bash args="command=pwd" truncated=false runId=run_...
 ```
 
 - `agent chat` 默认开启 realtime trace；`agent run` 默认关闭，可用 `--trace` 开启。
@@ -633,10 +636,11 @@ system prompt 不能继续由 `AgentRequest` 默认值、多个 `UserPromptSubmi
 - 工具参数和工具结果只展示安全摘要，默认最多 500 字符，并标记 `truncated=true|false`。
 - 明显敏感 key 会被 mask，包括 password、token、secret、api_key、authorization、credential、private_key，以及大段写入/编辑内容字段。
 - provider `reasoning_content` 只用于兼容后续请求，不进入默认 trace。
+- `agent runs list` / `agent runs show <runId>` 可以读取本地 audit；`--json` 输出原始 JSONL。
 
 **Next:**
 
-- 如果 trace 要进入文件或 JSONL，需要新增 sink，而不是改变默认 stderr 单行格式。
+- 增加更细的 policy decision audit，包括 matched rule、contexts、action 和 human decision。
 - 可加入 section cache hit/miss、memory retrieval 命中原因等更细事件，但必须继续遵守安全摘要边界。
 - 如果未来支持 streaming，trace 需要区分 token stream 和 agent lifecycle event。
 

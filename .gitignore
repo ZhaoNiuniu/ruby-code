@@ -3,6 +3,7 @@
 target/
 */target/
 
+.runs/
 .memory/
 MEMORY.md
 .scheduled_tasks.json

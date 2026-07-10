@@ -1,0 +1,51 @@
+{
+  "id": "mcp_tool_call_approved",
+  "category": "mcp",
+  "profile": "dev",
+  "task": "Call the external MCP echo tool.",
+  "approval": "allow",
+  "modelSteps": [
+    {
+      "type": "tool_call",
+      "toolCallId": "call_mcp_1",
+      "toolName": "mcp__demo__echo",
+      "arguments": {
+        "text": "hello mcp"
+      }
+    },
+    {
+      "type": "final_answer",
+      "content": "MCP echo completed."
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "finalAnswerContains": "MCP",
+    "auditSequence": [
+      {
+        "type": "TOOL_CALL",
+        "attributes": {
+          "tool": "mcp__demo__echo"
+        }
+      },
+      {
+        "type": "TOOL_RESULT",
+        "attributes": {
+          "tool": "mcp__demo__echo",
+          "success": "true"
+        }
+      },
+      {
+        "type": "FINAL_ANSWER"
+      }
+    ],
+    "forbiddenEvents": [
+      {
+        "type": "PERMISSION_DENIED",
+        "attributes": {
+          "tool": "mcp__demo__echo"
+        }
+      }
+    ]
+  }
+}

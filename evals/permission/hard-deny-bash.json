@@ -1,0 +1,54 @@
+{
+  "id": "permission_hard_deny_bash",
+  "category": "permission",
+  "profile": "dev",
+  "task": "Run a dangerous command.",
+  "modelSteps": [
+    {
+      "type": "tool_call",
+      "toolCallId": "call_bash_1",
+      "toolName": "bash",
+      "arguments": {
+        "command": "sudo ls"
+      }
+    },
+    {
+      "type": "final_answer",
+      "content": "Permission was denied, so I did not execute the command."
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "finalAnswerContains": "denied",
+    "auditSequence": [
+      {
+        "type": "TOOL_CALL",
+        "attributes": {
+          "tool": "bash"
+        }
+      },
+      {
+        "type": "PERMISSION_DENIED",
+        "attributes": {
+          "tool": "bash",
+          "success": "false"
+        }
+      },
+      {
+        "type": "FINAL_ANSWER"
+      }
+    ],
+    "forbiddenEvents": [
+      {
+        "type": "TOOL_RESULT",
+        "attributes": {
+          "tool": "bash",
+          "success": "true"
+        }
+      }
+    ],
+    "forbiddenTools": [
+      "write_file"
+    ]
+  }
+}

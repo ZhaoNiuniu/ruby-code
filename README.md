@@ -9,6 +9,7 @@
 - `agent-provider-openai-compatible`: an OpenAI-compatible Chat Completions provider with native tool calling.
 - `agent-runtime`: runtime profile resolution, tool filtering, and profile-aware permission decisions.
 - `agent-cli`: a picocli-based command line entry point for local smoke tests.
+- `agent-evals`: deterministic behavioral evals that replay scripted model steps against the runtime.
 
 ## Requirements
 
@@ -19,6 +20,7 @@
 
 ```bash
 mvn test
+mvn -pl agent-evals test
 ```
 
 ## Roadmap and Decisions
@@ -294,21 +296,72 @@ java -jar agent-cli/target/agent-cli-0.1.0-SNAPSHOT.jar run \
 
 `--max-output-tokens` remains the context-compression budget parameter. Use `--generation-max-output-tokens` for the `max_tokens` value sent to the model provider.
 
-## Runtime Trace
+## Runtime Trace And Audit
 
 The CLI can show a safe realtime trace of what the agent is doing without printing provider `reasoning_content` or raw long-form model thinking. Trace lines are written to stderr and final answers remain on stdout.
 
 - `agent chat` enables trace by default; use `--no-trace` to hide it.
 - `agent run` keeps trace off by default; use `--trace` to enable it.
 - `AgentResult.traceEvents()` contains the same runtime trace events for SDK callers.
+- Persistent safe audit is enabled by default and writes `.runs/{runId}.jsonl` plus `.runs/RUNS.jsonl`; use `--no-audit` to disable it for one run/chat process.
+- `AgentResult.runId()` and `AgentResult.auditEvents()` expose the same safe audit timeline to SDK callers.
 
 Trace output uses a single-line format:
 
 ```text
-[trace] tool_call tool=bash args="command=pwd" truncated=false
+[trace] tool_call tool=bash args="command=pwd" truncated=false runId=run_...
 ```
 
 The v1 event set is `MODEL_CALL`, `TOOL_CALL`, `TOOL_RESULT`, `TASK_NOTIFICATION`, `COMPRESSION`, `RECOVERY`, `PERMISSION_DENIED`, `ERROR`, and `FINAL_ANSWER`. Tool arguments and tool results are summarized to 500 characters by default, mark whether they were truncated, and mask obvious sensitive keys such as tokens, passwords, secrets, API keys, credentials, authorization values, and large write/edit content fields.
+
+Audit files use JSONL and preserve the same safe-summary boundary. They record `runId`, sequence, timestamp, actor, phase, parent/correlation ids, event type, and event attributes. They do not store full provider reasoning, raw messages, API keys, or full tool payloads.
+
+```bash
+agent runs list
+agent runs show run_...
+agent runs show run_... --json
+```
+
+## Behavioral Evals
+
+Deterministic behavioral evals live under `evals/` and run through the `agent-evals` Maven module. These evals use JSON cases plus a scripted model to verify runtime behavior such as tool calling, permission denial, MCP-shaped tools, teammate permission boundaries, and model-call recovery. They do not call live LLM providers by default and do not evaluate model quality.
+
+Each case declares a task, profile, scripted `modelSteps`, and expected safe audit patterns. The runner asserts against `AgentResult.auditEvents()` rather than CLI trace formatting, then writes a JSON report under `agent-evals/target/eval-reports/`.
+
+```bash
+mvn -pl agent-evals test
+```
+
+Minimal case shape:
+
+```json
+{
+  "id": "tool_calling_read_file_loop",
+  "category": "tool-calling",
+  "profile": "dev",
+  "task": "Read a project file and summarize it.",
+  "modelSteps": [
+    {
+      "type": "tool_call",
+      "toolCallId": "call_read_1",
+      "toolName": "read_file",
+      "arguments": { "path": "README.md" }
+    },
+    {
+      "type": "final_answer",
+      "content": "Read file completed."
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "finalAnswerContains": "completed",
+    "auditSequence": [
+      { "type": "TOOL_CALL", "attributes": { "tool": "read_file" } },
+      { "type": "TOOL_RESULT", "attributes": { "tool": "read_file", "success": "true" } }
+    ]
+  }
+}
+```
 
 ## Persistent Memory
 

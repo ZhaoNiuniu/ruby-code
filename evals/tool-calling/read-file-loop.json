@@ -1,0 +1,60 @@
+{
+  "id": "tool_calling_read_file_loop",
+  "category": "tool-calling",
+  "profile": "dev",
+  "task": "Read a project file and summarize it.",
+  "modelSteps": [
+    {
+      "type": "tool_call",
+      "toolCallId": "call_read_1",
+      "toolName": "read_file",
+      "arguments": {
+        "path": "README.md"
+      }
+    },
+    {
+      "type": "final_answer",
+      "content": "Read file completed."
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "finalAnswerContains": "completed",
+    "auditSequence": [
+      {
+        "type": "MODEL_CALL",
+        "phase": "main",
+        "attributes": {
+          "status": "start"
+        }
+      },
+      {
+        "type": "TOOL_CALL",
+        "attributes": {
+          "tool": "read_file"
+        }
+      },
+      {
+        "type": "TOOL_RESULT",
+        "attributes": {
+          "tool": "read_file",
+          "success": "true"
+        }
+      },
+      {
+        "type": "FINAL_ANSWER",
+        "attributes": {
+          "completed": "true"
+        }
+      }
+    ],
+    "forbiddenEvents": [
+      {
+        "type": "PERMISSION_DENIED"
+      },
+      {
+        "type": "ERROR"
+      }
+    ]
+  }
+}

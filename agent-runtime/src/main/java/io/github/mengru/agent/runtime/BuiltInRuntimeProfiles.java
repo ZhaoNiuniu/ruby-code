@@ -34,7 +34,7 @@ final class BuiltInRuntimeProfiles {
                         8192,
                         65536
                 ),
-                new TraceSettings(false, "stderr"),
+                new TraceSettings(false, "file"),
                 new PolicySettings(BuiltInPolicies.DEV, null)
         );
     }

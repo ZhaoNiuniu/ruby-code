@@ -3,6 +3,7 @@ package io.github.mengru.agent.core;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.AgentStep;
+import io.github.mengru.agent.api.AuditEvent;
 import io.github.mengru.agent.api.BackgroundTaskNotification;
 import io.github.mengru.agent.api.ContextCompressionEvent;
 import io.github.mengru.agent.api.ModelErrorCode;
@@ -22,6 +23,7 @@ import io.github.mengru.agent.core.hook.PostToolUseContext;
 import io.github.mengru.agent.core.hook.PreToolUseContext;
 import io.github.mengru.agent.core.hook.StopContext;
 import io.github.mengru.agent.core.hook.UserPromptSubmitContext;
+import io.github.mengru.agent.core.audit.FileRunAuditSink;
 import io.github.mengru.agent.core.permission.DefaultPermissionChecker;
 import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.context.ContextManager;
@@ -35,9 +37,11 @@ import io.github.mengru.agent.core.tool.ToolRegistry;
 import io.github.mengru.agent.core.tool.local.BashTool;
 import io.github.mengru.agent.core.tool.subagent.SubagentTool;
 import io.github.mengru.agent.core.tool.todo.TodoWriteTool;
+import io.github.mengru.agent.core.trace.TraceSink;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -382,10 +386,14 @@ class DefaultAgentTest {
                 emitted::add
         );
 
-        AgentResult result = agent.run(new AgentRequest("trace", 2, java.util.Map.of()));
+        AgentResult result = agent.run(new AgentRequest("trace", 2, java.util.Map.of(
+                "agent.run.id", "run_trace_test"
+        )));
 
         assertThat(result.completed()).isTrue();
         assertThat(emitted).containsExactlyElementsOf(result.traceEvents());
+        assertThat(result.traceEvents())
+                .allSatisfy(event -> assertThat(event.attributes()).containsEntry("runId", "run_trace_test"));
         assertThat(result.traceEvents())
                 .extracting(TraceEvent::type)
                 .contains(
@@ -410,6 +418,80 @@ class DefaultAgentTest {
                 .orElseThrow();
         assertThat(toolResult.attributes()).containsEntry("truncated", "true");
         assertThat(toolResult.attributes().get("summary")).hasSize(500);
+    }
+
+    @Test
+    void recordsSafeAuditEventsAndWritesRunFile() {
+        ObjectNode arguments = JsonNodeFactory.instance.objectNode();
+        arguments.put("api_key", "secret-value");
+        arguments.put("query", "visible query");
+        Tool auditTool = testTool("audit_tool", request -> ToolResult.success("audit output"));
+        DefaultAgent agent = new DefaultAgent(
+                (request, previousSteps, tools) -> {
+                    if (previousSteps.isEmpty()) {
+                        return AgentStep.toolCall("call-audit", "audit_tool", arguments);
+                    }
+                    return AgentStep.finalAnswer("done");
+                },
+                ToolRegistry.of(List.of(auditTool)),
+                HookRegistry.empty(),
+                ContextManager.defaults(),
+                ModelCallRecovery.defaults(),
+                BackgroundTaskManager.disabled(),
+                TraceSink.noop(),
+                new FileRunAuditSink(workspace)
+        );
+
+        AgentResult result = agent.run(new AgentRequest("audit", 2, java.util.Map.of(
+                "agent.run.id", "run_audit_test",
+                "agent.actor", "lead:tester"
+        )));
+
+        assertThat(result.runId()).isEqualTo("run_audit_test");
+        assertThat(result.auditEvents())
+                .extracting(AuditEvent::type)
+                .contains(AuditEvent.Type.RUN_START, AuditEvent.Type.TOOL_CALL, AuditEvent.Type.RUN_END);
+        AuditEvent toolCall = result.auditEvents().stream()
+                .filter(event -> event.type() == AuditEvent.Type.TOOL_CALL)
+                .findFirst()
+                .orElseThrow();
+        assertThat(toolCall.actor()).isEqualTo("lead:tester");
+        assertThat(toolCall.runId()).isEqualTo("run_audit_test");
+        assertThat(toolCall.attributes()).doesNotContainKey("runId");
+        assertThat(toolCall.attributes().get("args"))
+                .contains("api_key=[masked]")
+                .contains("query=visible query")
+                .doesNotContain("secret-value");
+        assertThat(workspace.resolve(".runs").resolve("run_audit_test.jsonl")).exists();
+        assertThat(workspace.resolve(".runs").resolve("RUNS.jsonl")).exists();
+    }
+
+    @Test
+    void auditWriteFailureDoesNotFailRun() throws Exception {
+        Path fileInsteadOfWorkspace = workspace.resolve("not-a-directory");
+        Files.writeString(fileInsteadOfWorkspace, "plain file");
+        DefaultAgent agent = new DefaultAgent(
+                (request, previousSteps, tools) -> AgentStep.finalAnswer("done"),
+                ToolRegistry.of(List.of()),
+                HookRegistry.empty(),
+                ContextManager.defaults(),
+                ModelCallRecovery.defaults(),
+                BackgroundTaskManager.disabled(),
+                TraceSink.noop(),
+                new FileRunAuditSink(fileInsteadOfWorkspace)
+        );
+
+        AgentResult result = agent.run(new AgentRequest("audit failure", 2, java.util.Map.of(
+                "agent.run.id", "run_audit_failure"
+        )));
+
+        assertThat(result.completed()).isTrue();
+        assertThat(result.auditEvents())
+                .anySatisfy(event -> {
+                    assertThat(event.type()).isEqualTo(AuditEvent.Type.ERROR);
+                    assertThat(event.phase()).isEqualTo("audit");
+                    assertThat(event.attributes()).containsEntry("reason", "audit-write-failed");
+                });
     }
 
     @Test

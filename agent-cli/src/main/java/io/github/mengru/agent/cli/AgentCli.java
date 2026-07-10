@@ -1,6 +1,7 @@
 package io.github.mengru.agent.cli;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.mengru.agent.api.AuditEvent;
 import io.github.mengru.agent.api.AgentRequest;
 import io.github.mengru.agent.api.AgentResult;
 import io.github.mengru.agent.api.ModelClient;
@@ -9,6 +10,9 @@ import io.github.mengru.agent.api.Tool;
 import io.github.mengru.agent.core.AgentSession;
 import io.github.mengru.agent.core.background.BackgroundTaskManager;
 import io.github.mengru.agent.core.DefaultAgent;
+import io.github.mengru.agent.core.audit.FileRunAuditSink;
+import io.github.mengru.agent.core.audit.RunAuditSink;
+import io.github.mengru.agent.core.audit.RunAuditSummary;
 import io.github.mengru.agent.core.EchoModelClient;
 import io.github.mengru.agent.core.context.ContextCompressionConfig;
 import io.github.mengru.agent.core.context.ContextManager;
@@ -64,6 +68,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -117,6 +122,7 @@ public final class AgentCli implements Callable<Integer> {
         commandLine.addSubcommand("run", new RunCommand(environment, inputStream, interactiveApproval));
         commandLine.addSubcommand("chat", new ChatCommand(environment, inputStream, interactiveApproval));
         commandLine.addSubcommand("memory", new MemoryCommand());
+        commandLine.addSubcommand("runs", runsCommand());
         CommandLine profile = new CommandLine(new ProfileCommand());
         profile.addSubcommand("show", new ProfileShowCommand(environment));
         commandLine.addSubcommand("profile", profile);
@@ -133,6 +139,7 @@ public final class AgentCli implements Callable<Integer> {
         commandLine.addSubcommand("run", new RunCommand(environment, inputStream, interactiveApproval, fixedModelClient));
         commandLine.addSubcommand("chat", new ChatCommand(environment, inputStream, interactiveApproval, fixedModelClient));
         commandLine.addSubcommand("memory", new MemoryCommand());
+        commandLine.addSubcommand("runs", runsCommand());
         CommandLine profile = new CommandLine(new ProfileCommand());
         profile.addSubcommand("show", new ProfileShowCommand(environment));
         commandLine.addSubcommand("profile", profile);
@@ -193,6 +200,52 @@ public final class AgentCli implements Callable<Integer> {
                 chatConsole.afterAsyncOutput(false);
             }
         };
+    }
+
+    private static CommandLine runsCommand() {
+        CommandLine runs = new CommandLine(new RunsCommand());
+        runs.addSubcommand("list", new RunsListCommand());
+        runs.addSubcommand("show", new RunsShowCommand());
+        return runs;
+    }
+
+    private static RunAuditSink runAuditSink(RuntimeSettings settings, boolean noAudit) {
+        if (noAudit || !fileAuditEnabled(settings)) {
+            return RunAuditSink.noop();
+        }
+        ensureRunsGitIgnore();
+        return new FileRunAuditSink(WORKSPACE_ROOT);
+    }
+
+    private static boolean fileAuditEnabled(RuntimeSettings settings) {
+        String sink = settings.traceSink();
+        return "file".equals(sink) || "both".equals(sink);
+    }
+
+    private static boolean stderrTraceEnabled(RuntimeSettings settings) {
+        String sink = settings.traceSink();
+        return settings.traceEnabled() || "stderr".equals(sink) || "both".equals(sink);
+    }
+
+    private static void ensureRunsGitIgnore() {
+        if (!Files.exists(WORKSPACE_ROOT.resolve(".git"))) {
+            return;
+        }
+        Path gitignore = WORKSPACE_ROOT.resolve(".gitignore");
+        try {
+            String existing = Files.exists(gitignore) ? Files.readString(gitignore) : "";
+            if (existing.lines().map(String::strip).noneMatch(".runs/"::equals)) {
+                String prefix = existing.isBlank() || existing.endsWith(System.lineSeparator()) ? "" : System.lineSeparator();
+                Files.writeString(
+                        gitignore,
+                        prefix + ".runs/" + System.lineSeparator(),
+                        StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.APPEND
+                );
+            }
+        } catch (IOException ignored) {
+        }
     }
 
     private static boolean isCronTriggered(PermissionRequest request) {
@@ -316,6 +369,9 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--trace", description = "Print safe runtime trace events to stderr.")
         private boolean trace;
 
+        @Option(names = "--no-audit", description = "Disable persistent run audit files in .runs.")
+        private boolean noAudit;
+
         @Option(names = "--color", defaultValue = "auto", description = "Color output: auto, always, never.")
         private String color;
 
@@ -353,6 +409,7 @@ public final class AgentCli implements Callable<Integer> {
                     ModelClient modelClient = createModelClient(settings);
                     BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.disabled();
                     UserApprover userApprover = createUserApprover(terminalStyle);
+                    RunAuditSink auditSink = runAuditSink(settings, noAudit);
                     SkillCatalog skillCatalog = SkillCatalog.scanDefault();
                     MemoryStore memoryStore = MemoryStore.defaultStore();
                     MemoryCatalog memoryCatalog = prepareMemoryCatalog(memoryStore);
@@ -368,7 +425,8 @@ public final class AgentCli implements Callable<Integer> {
                             createContextManager(settings),
                             createErrorRecoveryConfig(settings),
                             backgroundTaskManager,
-                            settings.traceEnabled() ? stderrTraceSink(spec, terminalStyle) : TraceSink.noop()
+                            stderrTraceEnabled(settings) ? stderrTraceSink(spec, terminalStyle) : TraceSink.noop(),
+                            auditSink
                     );
                     AgentRequest request = new AgentRequest(task, maxSteps, requestMetadata(settings), settings.system())
                             .withModelOptions(modelOptions);
@@ -490,6 +548,9 @@ public final class AgentCli implements Callable<Integer> {
         private Map<String, String> requestMetadata(RuntimeSettings settings) {
             LinkedHashMap<String, String> metadata = new LinkedHashMap<>(modelIdentityMetadata(settings, fixedModelClient != null));
             metadata.put(TaskManager.AGENT_NAME_METADATA_KEY, resolvedAgentName());
+            metadata.put("agent.actor", "lead:" + resolvedAgentName());
+            metadata.put("agent.profile.name", settings.profileName());
+            metadata.put("agent.policy.name", settings.policyName());
             return Map.copyOf(metadata);
         }
 
@@ -627,6 +688,9 @@ public final class AgentCli implements Callable<Integer> {
         @Option(names = "--no-trace", description = "Disable safe runtime trace events in chat.")
         private boolean noTrace;
 
+        @Option(names = "--no-audit", description = "Disable persistent run audit files in .runs.")
+        private boolean noAudit;
+
         @Option(names = "--color", defaultValue = "auto", description = "Color output: auto, always, never.")
         private String color;
 
@@ -666,6 +730,7 @@ public final class AgentCli implements Callable<Integer> {
                 modelOptions = createModelOptions(settings);
                 ModelClient modelClient = createModelClient(settings);
                 BackgroundTaskManager backgroundTaskManager = BackgroundTaskManager.defaults();
+                RunAuditSink auditSink = runAuditSink(settings, noAudit);
                 CronQueue cronQueue = new CronQueue();
                 ScheduledTaskManager scheduledTaskManager = new ScheduledTaskManager(ScheduledJobStore.defaultStore(), cronQueue);
                 TaskManager taskManager = TaskManager.defaultManager();
@@ -686,7 +751,8 @@ public final class AgentCli implements Callable<Integer> {
                         modelOptions,
                         settings.system(),
                         requestMetadata(settings),
-                        new PolicyPermissionChecker(settings, WORKSPACE_ROOT)
+                        new PolicyPermissionChecker(settings, WORKSPACE_ROOT),
+                        auditSink
                 );
                 ToolRegistry toolRegistry = applyRuntimeToolFilter(withMcpTools(
                         ToolRegistry.defaultToolsWithSubagent(
@@ -707,7 +773,8 @@ public final class AgentCli implements Callable<Integer> {
                         createContextManager(settings),
                         createErrorRecoveryConfig(settings),
                         backgroundTaskManager,
-                        settings.traceEnabled() ? stderrTraceSink(spec, chatConsole, terminalStyle) : TraceSink.noop()
+                        (!noTrace && stderrTraceEnabled(settings)) ? stderrTraceSink(spec, chatConsole, terminalStyle) : TraceSink.noop(),
+                        auditSink
                 ), backgroundTaskManager);
                 teamInboxPoller = new TeamInboxPoller(
                         teamRuntime,
@@ -895,7 +962,7 @@ public final class AgentCli implements Callable<Integer> {
                     .modelRetryAttempts(modelRetryAttempts)
                     .generationMaxOutputTokens(generationMaxOutputTokens)
                     .recoveryMaxOutputTokens(recoveryMaxOutputTokens)
-                    .traceEnabled(noTrace ? false : (profile == null || profile.isBlank() ? true : null))
+                    .traceEnabled(noTrace ? false : true)
                     .build();
         }
 
@@ -1283,6 +1350,156 @@ public final class AgentCli implements Callable<Integer> {
                 result.complete(approved);
             }
         }
+    }
+
+    @Command(
+            name = "runs",
+            description = "Inspect local run audit logs."
+    )
+    static final class RunsCommand implements Callable<Integer> {
+
+        @Spec
+        private CommandSpec spec;
+
+        @Override
+        public Integer call() {
+            spec.commandLine().usage(System.out);
+            return 0;
+        }
+    }
+
+    @Command(name = "list", description = "List recent local run audit summaries.")
+    static final class RunsListCommand implements Callable<Integer> {
+
+        @Spec
+        private CommandSpec spec;
+
+        @Option(names = "--json", description = "Print raw RUNS.jsonl records.")
+        private boolean json;
+
+        @Option(names = "--limit", defaultValue = "20", description = "Maximum summaries to display.")
+        private int limit;
+
+        @Override
+        public Integer call() {
+            Path index = WORKSPACE_ROOT.resolve(FileRunAuditSink.RUNS_DIR).resolve(FileRunAuditSink.INDEX_FILE);
+            if (!Files.exists(index)) {
+                spec.commandLine().getOut().println(json ? "" : "No runs.");
+                return 0;
+            }
+            try {
+                List<String> lines = Files.readAllLines(index, StandardCharsets.UTF_8).stream()
+                        .filter(line -> !line.isBlank())
+                        .toList();
+                List<String> selected = lines.stream()
+                        .skip(Math.max(0, lines.size() - Math.max(0, limit)))
+                        .toList();
+                if (json) {
+                    for (String line : selected) {
+                        spec.commandLine().getOut().println(line);
+                    }
+                    return 0;
+                }
+                for (String line : selected) {
+                    RunAuditSummary summary = JSON.readValue(line, RunAuditSummary.class);
+                    spec.commandLine().getOut().println("%s %s %s %s %s".formatted(
+                            summary.runId(),
+                            summary.status(),
+                            blank(summary.actor(), "-"),
+                            blank(summary.trigger(), "-"),
+                            shortSummary(summary.summary())
+                    ));
+                }
+                return 0;
+            } catch (IOException e) {
+                spec.commandLine().getErr().println("failed to read run index: " + e.getMessage());
+                return CommandLine.ExitCode.SOFTWARE;
+            }
+        }
+    }
+
+    @Command(name = "show", description = "Show one local run audit timeline.")
+    static final class RunsShowCommand implements Callable<Integer> {
+
+        @Spec
+        private CommandSpec spec;
+
+        @Parameters(paramLabel = "RUN_ID", description = "Run id to display.")
+        private String runId;
+
+        @Option(names = "--json", description = "Print raw run JSONL.")
+        private boolean json;
+
+        @Override
+        public Integer call() {
+            if (runId == null || !runId.matches("[A-Za-z0-9_-]+")) {
+                spec.commandLine().getErr().println("runId must match [A-Za-z0-9_-]+: " + runId);
+                return CommandLine.ExitCode.USAGE;
+            }
+            Path runFile = WORKSPACE_ROOT.resolve(FileRunAuditSink.RUNS_DIR).resolve(runId + ".jsonl");
+            if (!Files.exists(runFile)) {
+                spec.commandLine().getErr().println("Run not found: " + runId);
+                return CommandLine.ExitCode.USAGE;
+            }
+            try {
+                List<String> lines = Files.readAllLines(runFile, StandardCharsets.UTF_8).stream()
+                        .filter(line -> !line.isBlank())
+                        .toList();
+                if (json) {
+                    for (String line : lines) {
+                        spec.commandLine().getOut().println(line);
+                    }
+                    return 0;
+                }
+                for (String line : lines) {
+                    AuditEvent event = JSON.readValue(line, AuditEvent.class);
+                    spec.commandLine().getOut().println(formatAuditEvent(event));
+                }
+                return 0;
+            } catch (IOException e) {
+                spec.commandLine().getErr().println("failed to read run audit: " + e.getMessage());
+                return CommandLine.ExitCode.SOFTWARE;
+            }
+        }
+    }
+
+    private static String formatAuditEvent(AuditEvent event) {
+        StringBuilder builder = new StringBuilder()
+                .append(event.timestamp())
+                .append(' ')
+                .append(event.type().name().toLowerCase(java.util.Locale.ROOT));
+        if (!event.actor().isBlank()) {
+            builder.append(" actor=").append(event.actor());
+        }
+        if (!event.phase().isBlank()) {
+            builder.append(" phase=").append(event.phase());
+        }
+        if (!event.parentRunId().isBlank()) {
+            builder.append(" parent=").append(event.parentRunId());
+        }
+        if (!event.correlationId().isBlank()) {
+            builder.append(" correlation=").append(event.correlationId());
+        }
+        event.attributes().forEach((key, value) ->
+                builder.append(' ').append(key).append('=').append(quoteIfNeeded(value)));
+        return builder.toString();
+    }
+
+    private static String quoteIfNeeded(String value) {
+        String normalized = value == null ? "" : value;
+        if (normalized.matches("[A-Za-z0-9_./:@=-]+")) {
+            return normalized;
+        }
+        return "\"" + normalized.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    private static String blank(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private static String shortSummary(String value) {
+        String normalized = value == null ? "" : value.strip();
+        return normalized.length() <= 120 ? normalized : normalized.substring(0, 120) + "...";
     }
 
     @Command(

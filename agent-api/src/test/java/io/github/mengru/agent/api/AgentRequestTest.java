@@ -172,6 +172,29 @@ class AgentRequestTest {
     }
 
     @Test
+    void agentResultCopiesAuditEvents() {
+        List<AuditEvent> events = new ArrayList<>();
+        events.add(AuditEvent.of(
+                "run_1",
+                1,
+                AuditEvent.Type.MODEL_CALL,
+                "lead:main",
+                "main",
+                "",
+                "",
+                Map.of("status", "start")
+        ));
+
+        AgentResult result = new AgentResult("ok", List.of(), true, List.of(), List.of(), List.of(), "run_1", events);
+        events.clear();
+
+        assertThat(result.runId()).isEqualTo("run_1");
+        assertThat(result.auditEvents()).hasSize(1);
+        assertThatThrownBy(() -> result.auditEvents().clear())
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
     void promptTooLongExceptionIsTypedModelException() {
         PromptTooLongException exception = new PromptTooLongException("too long");
 

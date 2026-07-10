@@ -1,0 +1,53 @@
+{
+  "id": "recovery_transient_retry",
+  "category": "recovery",
+  "profile": "dev",
+  "task": "Recover from a transient provider failure.",
+  "modelSteps": [
+    {
+      "type": "error",
+      "errorCode": "TRANSIENT",
+      "message": "rate limited"
+    },
+    {
+      "type": "final_answer",
+      "content": "Recovered after retry."
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "finalAnswerContains": "Recovered",
+    "auditSequence": [
+      {
+        "type": "MODEL_CALL",
+        "phase": "main",
+        "attributes": {
+          "status": "failed",
+          "error": "TRANSIENT"
+        }
+      },
+      {
+        "type": "MODEL_CALL",
+        "phase": "transient_retry_1",
+        "attributes": {
+          "status": "success"
+        }
+      },
+      {
+        "type": "RECOVERY",
+        "attributes": {
+          "code": "TRANSIENT",
+          "recovered": "true"
+        }
+      },
+      {
+        "type": "FINAL_ANSWER"
+      }
+    ],
+    "forbiddenEvents": [
+      {
+        "type": "ERROR"
+      }
+    ]
+  }
+}

@@ -111,6 +111,7 @@ public final class RuntimeProfileResolver {
         validateNonNegative(profile.errorRecovery().modelRetryAttempts(), "errorRecovery.modelRetryAttempts");
         validatePositive(profile.errorRecovery().generationMaxOutputTokens(), "errorRecovery.generationMaxOutputTokens");
         validatePositive(profile.errorRecovery().recoveryMaxOutputTokens(), "errorRecovery.recoveryMaxOutputTokens");
+        validateTraceSink(profile.trace().sink());
 
         return new RuntimeSettings(
                 profileName,
@@ -262,6 +263,19 @@ public final class RuntimeProfileResolver {
     private static void validateNonNegative(Integer value, String field) {
         if (value != null && value < 0) {
             throw new RuntimeProfileException("Runtime profile field must be non-negative: " + field);
+        }
+    }
+
+    private static void validateTraceSink(String value) {
+        if (value == null) {
+            return;
+        }
+        String normalized = value.strip();
+        if (!"stderr".equals(normalized)
+                && !"file".equals(normalized)
+                && !"both".equals(normalized)
+                && !"none".equals(normalized)) {
+            throw new RuntimeProfileException("trace.sink must be one of stderr, file, both, none: " + value);
         }
     }
 

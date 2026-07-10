@@ -10,8 +10,8 @@ Status / Why / Design direction / Next
 
 ## Current Focus
 
-- 当前阶段：**Stage 2 Policy Config / Permission Engine v1 已落地**，下一步进入 **Stage 3 Run Trace And Audit Log**。
-- 当前重点：让 policy 决策可审计、可回放，把命中的 policy name、context、action 和审批结果写入持久 run trace。
+- 当前阶段：**Stage 4 Evals And Behavioral Regression v1 已落地**，下一步进入 **Stage 5 Service Runtime Boundary**。
+- 当前重点：用 `agent-evals` 和 `evals/**/*.json` 把关键 runtime 行为固定成 deterministic regression，后续再扩展 live/manual eval。
 - Last updated: 2026-07-07
 
 ## Phase 2 North Star
@@ -35,6 +35,8 @@ Status / Why / Design direction / Next
 | 2026-07-07 | CLI 参数保留，但语义改为覆盖 profile，而不是所有运行时能力都从 CLI 拼装 | 避免 CLI 成为装配中心，让 SDK 和未来服务入口复用同一套 runtime assembly |
 | 2026-07-07 | Stage 1 v1 以 `agent-runtime` 输出 `RuntimeSettings`，CLI 生命周期暂不整体搬迁 | 先统一配置解析、工具过滤和 profile-aware permission，避免一次性重构 run/chat、team、cron、background 造成风险 |
 | 2026-07-07 | Stage 2 v1 采用独立 `.agent/policies/{name}.json`，profile 只引用 policy | 权限策略成为可复用、可审计的配置资产；hard deny 仍由代码保底 |
+| 2026-07-07 | Stage 3 v1 采用 Safe Summary audit，默认写 `.runs/{runId}.jsonl` 和 `.runs/RUNS.jsonl` | 保留可复盘时间线，同时避免把 provider reasoning、API key、完整工具 payload 或 raw messages 写入本地日志 |
+| 2026-07-07 | Stage 4 v1 采用 `agent-evals` Maven module + JSON case + scripted model，并以 `AuditEvent` 作为主要 oracle | 先固定 runtime 行为回归，不把默认 CI 绑定到真实模型质量和网络稳定性 |
 
 ## Stage 1: Runtime Profile Config
 
@@ -112,7 +114,7 @@ agent profile show readonly
   },
   "trace": {
     "enabled": true,
-    "sink": "stderr"
+    "sink": "file"
   },
   "policy": {
     "name": "dev"
@@ -219,20 +221,22 @@ built-in defaults
 
 ## Stage 3: Run Trace And Audit Log
 
-**Status:** Planned.
+**Status:** Implemented v1; richer policy-decision details and retention remain.
 
 **Why:**  
 当前 trace 可以实时打印到 stderr，也进入 `AgentResult`，但缺少持久审计。二期需要能回答：“这次 agent 为什么执行了这个命令？谁批准的？MCP 返回了什么摘要？压缩和恢复发生过吗？”
 
-**Design direction:**
+**Current implementation:**
 
-- 每次 run/chat turn 生成 `runId`。
-- 新增 `.runs/{runId}.jsonl`，默认本机私有，不提交 Git。
-- 写入安全事件，不写 API key，不写 provider raw reasoning。
-- 事件覆盖：
+- 每次 `agent run`、chat user turn、cron turn、team inbox turn、teammate turn 都生成独立 `runId`。
+- 新增 `AuditEvent` 和 `RunAuditSink`；`AgentResult` 携带 `runId` 和 `auditEvents`，旧构造器兼容。
+- 默认写 `.runs/{runId}.jsonl` 和 `.runs/RUNS.jsonl`；`.runs/` 不提交 Git。
+- `agent runs list` / `agent runs show <runId>` 提供最小只读查询，支持 `--json`。
+- 写入安全事件，不写 API key、不写 provider raw reasoning、不写 raw messages、不写完整工具 payload。
+- v1 事件覆盖：
   - model call start/success/failure
   - tool call/result summary
-  - permission request/decision
+  - permission denied summary
   - MCP call summary
   - background task notification
   - cron/team synthetic turn
@@ -241,45 +245,55 @@ built-in defaults
 
 **Next:**
 
-- 定义 `RunAuditSink`。
-- CLI profile 支持 `trace.sink=stderr|file|both|none`。
-- 增加 `agent runs list` / `agent runs show <runId>` 的最小只读命令。
+- 增加更细的 policy decision audit：policy name、contexts、matched rule、action、human decision。
+- 增加 `.runs` retention/prune，避免长期 chat 后目录无限增长。
+- 让 audit schema 成为 Stage 4 eval 的断言输入。
 
 ## Stage 4: Evals And Behavioral Regression
 
-**Status:** Planned.
+**Status:** Implemented v1; live/manual provider eval and broader suites remain.
 
 **Why:**  
 普通单元测试能保证代码路径，但 agent 的关键风险是行为漂移：模型是否会调用该工具？权限拒绝后是否会修正？MCP 工具是否被过度信任？team 是否重复汇报？这些需要固定 eval。
 
-**Design direction:**
+**Current implementation:**
 
-- 新增 `evals/`：
+- 新增 `agent-evals` Maven module，默认随根 `mvn test` 运行 deterministic eval。
+- 新增 `evals/` JSON case 目录：
 
 ```text
 evals/
   tool-calling/
   permission/
-  memory/
   mcp/
   team/
   recovery/
 ```
 
-- v1 eval 先不追求完整 benchmark，只做本地 deterministic fake model + scripted model。
-- 对真实模型 eval 标记为 manual/live，默认跳过。
-- 每条 eval 记录：
-  - prompt
+- v1 eval 使用 scripted model，不调用真实 LLM provider。
+- 每条 eval case 记录：
+  - task
   - profile
-  - expected trace pattern
-  - expected final answer pattern
+  - modelSteps
+  - expected audit pattern
+  - expected final answer substring
   - forbidden actions
+- Runner 使用独立临时 workspace 执行 case，判分主输入是 `AgentResult.auditEvents()`。
+- Matcher 采用模式匹配：只看 event type、actor、phase、attributes 子集和顺序片段，不匹配 `runId`、`seq`、`timestamp`。
+- Eval report 写到 `agent-evals/target/eval-reports/{caseId}.json`，不提交 Git。
+- 首批 deterministic case 覆盖：
+  - tool calling
+  - permission hard deny
+  - MCP-shaped tool call
+  - teammate permission denied boundary
+  - transient model error recovery
 
 **Next:**
 
-- 先做 `agent-evals` Maven module 或 CLI 内部 test harness 二选一。
-- 优先覆盖 MCP、permission、team permission、context compression、error recovery。
-- CI 中默认跑 deterministic eval，不跑 live provider eval。
+- 增加 live/manual provider eval profile，但默认 CI 继续只跑 deterministic eval。
+- 扩展 suites：memory、context compression、cron、background tasks、task system、subagent。
+- 增加 richer policy decision audit 后，把 matched rule / action / human decision 纳入 eval oracle。
+- 后续可新增 CLI `agent eval run`，但 v1 不把 eval 编排塞进 CLI。
 
 ## Stage 5: Service Runtime Boundary
 

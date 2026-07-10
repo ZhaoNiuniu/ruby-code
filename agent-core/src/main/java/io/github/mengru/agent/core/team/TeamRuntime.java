@@ -9,6 +9,9 @@ import io.github.mengru.agent.api.ModelClient;
 import io.github.mengru.agent.api.ModelOptions;
 import io.github.mengru.agent.core.AgentSession;
 import io.github.mengru.agent.core.DefaultAgent;
+import io.github.mengru.agent.core.audit.RunAuditSink;
+import io.github.mengru.agent.core.background.BackgroundTaskManager;
+import io.github.mengru.agent.core.context.ContextManager;
 import io.github.mengru.agent.core.hook.HookRegistry;
 import io.github.mengru.agent.core.memory.MemoryCatalog;
 import io.github.mengru.agent.core.permission.DefaultPermissionChecker;
@@ -17,6 +20,7 @@ import io.github.mengru.agent.core.permission.PermissionDecision;
 import io.github.mengru.agent.core.permission.PermissionRequest;
 import io.github.mengru.agent.core.permission.UserApprover;
 import io.github.mengru.agent.core.prompt.PromptMode;
+import io.github.mengru.agent.core.recovery.ModelCallRecovery;
 import io.github.mengru.agent.core.skill.SkillCatalog;
 import io.github.mengru.agent.core.task.TaskManager;
 import io.github.mengru.agent.core.tool.ToolRegistry;
@@ -58,6 +62,7 @@ public final class TeamRuntime implements AutoCloseable {
     private final String userInstructions;
     private final Map<String, String> baseMetadata;
     private final PermissionChecker teammatePermissionChecker;
+    private final RunAuditSink runAuditSink;
     private final Map<String, TeammateWorker> teammates = new ConcurrentHashMap<>();
     private final AtomicInteger nextTeammateId = new AtomicInteger();
     private volatile boolean closed;
@@ -86,7 +91,8 @@ public final class TeamRuntime implements AutoCloseable {
                 userInstructions,
                 baseMetadata,
                 new DefaultTeamPermissionReviewer(),
-                new DefaultPermissionChecker(workspace)
+                new DefaultPermissionChecker(workspace),
+                RunAuditSink.noop()
         );
     }
 
@@ -115,7 +121,39 @@ public final class TeamRuntime implements AutoCloseable {
                 userInstructions,
                 baseMetadata,
                 new DefaultTeamPermissionReviewer(),
-                teammatePermissionChecker
+                teammatePermissionChecker,
+                RunAuditSink.noop()
+        );
+    }
+
+    public TeamRuntime(
+            Path workspace,
+            String leadName,
+            ModelClient modelClient,
+            UserApprover humanApprover,
+            SkillCatalog skillCatalog,
+            MemoryCatalog memoryCatalog,
+            TaskManager taskManager,
+            ModelOptions modelOptions,
+            String userInstructions,
+            Map<String, String> baseMetadata,
+            PermissionChecker teammatePermissionChecker,
+            RunAuditSink runAuditSink
+    ) {
+        this(
+                workspace,
+                leadName,
+                modelClient,
+                humanApprover,
+                skillCatalog,
+                memoryCatalog,
+                taskManager,
+                modelOptions,
+                userInstructions,
+                baseMetadata,
+                new DefaultTeamPermissionReviewer(),
+                teammatePermissionChecker,
+                runAuditSink
         );
     }
 
@@ -144,7 +182,8 @@ public final class TeamRuntime implements AutoCloseable {
                 userInstructions,
                 baseMetadata,
                 teamPermissionReviewer,
-                new DefaultPermissionChecker(workspace)
+                new DefaultPermissionChecker(workspace),
+                RunAuditSink.noop()
         );
     }
 
@@ -162,6 +201,38 @@ public final class TeamRuntime implements AutoCloseable {
             TeamPermissionReviewer teamPermissionReviewer,
             PermissionChecker teammatePermissionChecker
     ) {
+        this(
+                workspace,
+                leadName,
+                modelClient,
+                humanApprover,
+                skillCatalog,
+                memoryCatalog,
+                taskManager,
+                modelOptions,
+                userInstructions,
+                baseMetadata,
+                teamPermissionReviewer,
+                teammatePermissionChecker,
+                RunAuditSink.noop()
+        );
+    }
+
+    public TeamRuntime(
+            Path workspace,
+            String leadName,
+            ModelClient modelClient,
+            UserApprover humanApprover,
+            SkillCatalog skillCatalog,
+            MemoryCatalog memoryCatalog,
+            TaskManager taskManager,
+            ModelOptions modelOptions,
+            String userInstructions,
+            Map<String, String> baseMetadata,
+            TeamPermissionReviewer teamPermissionReviewer,
+            PermissionChecker teammatePermissionChecker,
+            RunAuditSink runAuditSink
+    ) {
         this.teamId = "team_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         this.leadName = MessageBus.validateAgentName(leadName == null || leadName.isBlank() ? "main" : leadName);
         this.bus = new MessageBus(workspace, teamId);
@@ -174,8 +245,10 @@ public final class TeamRuntime implements AutoCloseable {
         this.modelOptions = modelOptions == null ? ModelOptions.defaults() : modelOptions;
         this.userInstructions = userInstructions == null ? "" : userInstructions.strip();
         this.teammatePermissionChecker = Objects.requireNonNull(teammatePermissionChecker, "teammatePermissionChecker must not be null");
+        this.runAuditSink = Objects.requireNonNull(runAuditSink, "runAuditSink must not be null");
         LinkedHashMap<String, String> metadata = new LinkedHashMap<>(baseMetadata == null ? Map.of() : baseMetadata);
         metadata.put(TaskManager.AGENT_NAME_METADATA_KEY, this.leadName);
+        metadata.put("agent.actor", "lead:" + this.leadName);
         metadata.put(TEAM_ID_METADATA_KEY, teamId);
         metadata.put(TEAM_LEAD_METADATA_KEY, this.leadName);
         this.baseMetadata = Map.copyOf(metadata);
@@ -245,6 +318,7 @@ public final class TeamRuntime implements AutoCloseable {
     public Map<String, String> teammateMetadata(String teammateName, String role) {
         LinkedHashMap<String, String> metadata = new LinkedHashMap<>(baseMetadata);
         metadata.put(TaskManager.AGENT_NAME_METADATA_KEY, teammateName);
+        metadata.put("agent.actor", "teammate:" + teammateName);
         metadata.put(TEAM_ROLE_METADATA_KEY, role);
         return Map.copyOf(metadata);
     }
@@ -473,7 +547,12 @@ public final class TeamRuntime implements AutoCloseable {
             DefaultAgent agent = new DefaultAgent(
                     modelClient,
                     tools,
-                    HookRegistry.defaultsFor(tools, teammateApprover(name), memoryCatalog, null, null, PromptMode.TEAMMATE, teammatePermissionChecker)
+                    HookRegistry.defaultsFor(tools, teammateApprover(name), memoryCatalog, null, null, PromptMode.TEAMMATE, teammatePermissionChecker),
+                    ContextManager.defaults(),
+                    ModelCallRecovery.defaults(),
+                    BackgroundTaskManager.disabled(),
+                    TraceSink.noop(),
+                    runAuditSink
             );
             this.session = new AgentSession(agent);
         }
@@ -520,10 +599,12 @@ public final class TeamRuntime implements AutoCloseable {
         private void handleMessage(TeamMessage message) {
             setStatus(TeammateStatus.ACTIVE, "processing " + message.type().value());
             reportedToLeadInCurrentTurn.set(false);
+            LinkedHashMap<String, String> metadata = new LinkedHashMap<>(teammateMetadata(name, role));
+            metadata.put("agent.correlationId", message.messageId());
             AgentResult result = session.run(new AgentRequest(
                     renderTeammateTask(message),
                     TEAMMATE_MAX_STEPS,
-                    teammateMetadata(name, role),
+                    metadata,
                     teammateInstructions(role, instructions)
             ).withModelOptions(modelOptions));
             String content = result.completed()

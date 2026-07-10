@@ -1,0 +1,50 @@
+{
+  "id": "team_teammate_permission_denied",
+  "category": "team",
+  "profile": "dev",
+  "task": "A teammate tries to write a workspace file.",
+  "metadata": {
+    "agent.actor": "teammate:alice",
+    "agent.name": "alice",
+    "agent.team.id": "team_eval",
+    "agent.team.role": "backend-developer"
+  },
+  "modelSteps": [
+    {
+      "type": "tool_call",
+      "toolCallId": "call_write_1",
+      "toolName": "write_file",
+      "arguments": {
+        "path": "team_eval_probe.txt",
+        "content": "hello"
+      }
+    },
+    {
+      "type": "final_answer",
+      "content": "The write was not approved."
+    }
+  ],
+  "expect": {
+    "completed": true,
+    "finalAnswerContains": "not approved",
+    "requiredEvents": [
+      {
+        "type": "PERMISSION_DENIED",
+        "actor": "teammate:alice",
+        "attributes": {
+          "tool": "write_file",
+          "success": "false"
+        }
+      }
+    ],
+    "forbiddenEvents": [
+      {
+        "type": "TOOL_RESULT",
+        "attributes": {
+          "tool": "write_file",
+          "success": "true"
+        }
+      }
+    ]
+  }
+}

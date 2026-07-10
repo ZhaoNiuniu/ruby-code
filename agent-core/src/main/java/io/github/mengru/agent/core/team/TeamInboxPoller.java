@@ -103,7 +103,7 @@ public final class TeamInboxPoller implements AutoCloseable {
                     AgentResult result = session.run(new AgentRequest(
                             runtime.renderLeadInbox(modelVisibleMessages),
                             maxSteps,
-                            teamMetadata(),
+                            teamMetadata(modelVisibleMessages),
                             systemPrompt
                     ).withModelOptions(modelOptions));
                     resultConsumer.accept(new TeamExecutionResult(modelVisibleMessages, result, true, ""));
@@ -142,10 +142,13 @@ public final class TeamInboxPoller implements AutoCloseable {
                 && message.type() != TeamMessageType.PERMISSION_RESPONSE;
     }
 
-    private Map<String, String> teamMetadata() {
+    private Map<String, String> teamMetadata(List<TeamMessage> messages) {
         LinkedHashMap<String, String> metadata = new LinkedHashMap<>(metadataSupplier.get());
         metadata.put("agent.trigger", "team");
         metadata.put(TeamRuntime.TEAM_ID_METADATA_KEY, runtime.teamId());
+        if (messages != null && !messages.isEmpty()) {
+            metadata.put("agent.correlationId", messages.get(0).messageId());
+        }
         return Map.copyOf(metadata);
     }
 }
